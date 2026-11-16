@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      # fm1buddy's core (lib/fm1core), where platformio.ini looks for it
+      - run: git clone --depth 1 https://github.com/konsumer/fm1buddy.git ../fm1buddy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install --upgrade platformio
+      - run: pio run
+        env:
+          PLATFORMIO_BUILD_FLAGS: -D FM1BUDDY_VERSION='"${{ github.event.release.tag_name || github.sha }}"'
+      - run: mkdir -p dist && cp .pio/build/cardputer/firmware.bin dist/cardbuddy.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cardbuddy
+          path: dist/cardbuddy.bin
+      - if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/cardbuddy.bin
