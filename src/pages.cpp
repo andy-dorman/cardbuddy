@@ -1,5 +1,6 @@
 // The pages: home, the firmware lists (the SD card's and the Hub's) and a firmware's details, Wi-Fi, settings, about
 #include <M5Cardputer.h>
+#include <strings.h>
 
 #include <algorithm>
 #include <vector>
@@ -7,6 +8,7 @@
 #include "catalog.h"
 #include "hal.h"
 #include "jobs.h"
+#include "midi.h"
 #include "settings.h"
 #include "themes.h"
 #include "ui.h"
@@ -45,8 +47,15 @@ static const Item HOME[] = {
     {"Sounds", ".syx, setups, SLOOP", []() { return soundsPage(); }},
     {"MIDI", "Devices, routing", []() { return midiPage(); }},
     {"Keys", "Play it from here", []() { return keysPage(); }},
-    {"Wi-Fi", "For the Hub", []() { return wifiPage(); }},
-    {"Settings", "Theme, brightness", []() { return settingsPage(); }},
+    {"USB disk", "The SD card, on a computer", []() -> Page* {
+       if (!hal::sd() || jobs::running) {
+         toast(hal::sd() ? "Busy with something else." : "No SD card.", true);
+       } else {
+         hal::diskModeSet(true);  // (it restarts as a USB disk)
+       }
+       return 0;
+     }},
+    {"Settings", "Wi-Fi, theme, brightness", []() { return settingsPage(); }},
     {"About", "Version, SD card, battery", []() { return aboutPage(); }},
 };
 #define HOME_N ((int)(sizeof HOME / sizeof HOME[0]))
@@ -54,7 +63,7 @@ static const Item HOME[] = {
 struct HomePage : Page {
   int sel = 0, scroll = 0;
   const char* title() override { return "cardbuddy"; }
-  const char* hints() override { return "; . move  enter open"; }
+  const char* hints() override { return HOME[sel].what; }  // (what the one chosen is)
   bool closing() override { return false; }
   void key(const Key& k) override {
     if (k.up) {
@@ -62,13 +71,13 @@ struct HomePage : Page {
     } else if (k.down) {
       sel = (sel + 1) % HOME_N;
     } else if (k.enter || k.right) {
-      push(HOME[sel].open());
+      if (Page* p = HOME[sel].open()) {
+        push(p);
+      }
     }
   }
   void draw() override {
-    listRows(HOME_N, sel, scroll, TOP + 2, 9, [](int i, int y, bool s, void*) {
-      text(6, y + 2, HOME[i].name, s ? TEXT : DIM);
-      textRight(SCREEN_W - 6, y + 2, HOME[i].what, s ? DIM : OFF); }, 0);
+    listRows(HOME_N, sel, scroll, TOP + 2, 9, [](int i, int y, bool s, void*) { text(6, y + 2, HOME[i].name, s ? TEXT : DIM); }, 0);
   }
 };
 
@@ -85,9 +94,9 @@ struct FirmwarePage : Page {
   const char* title() override { return f.name.c_str(); }
   const char* hints() override {
     if (fromHub && !f.onSd) {
-      return "d download  i install  ` back";
+      return "enter install  d download";
     }
-    return "i install  ; . scroll  ` back";
+    return "enter install";
   }
   void key(const Key& k) override {
     if (k.up && scroll > 0) {
@@ -96,11 +105,11 @@ struct FirmwarePage : Page {
       scroll++;
     } else if (k.ch == 'd' && fromHub && !f.onSd) {
       if (!settings.ssid[0]) {
-        toast("Set up Wi-Fi first (home > Wi-Fi).", true);
+        toast("Set up Wi-Fi first (Settings > Wi-Fi).", true);
       } else if (!jobs::download(f)) {
         toast("Busy with something else.", true);
       }
-    } else if (k.ch == 'i') {
+    } else if (k.enter) {
       install(f);
     }
   }
@@ -138,21 +147,54 @@ struct FirmwarePage : Page {
 };
 
 // -------------------------------------------------------------------------------------- the firmwares ---
+// a firmware on the SD card with this file name (the Hub's: what's on the card already)
+static bool onSd(const char* file) {
+  for (const FwItem& x : catalog::sd.items) {
+    if (!strcasecmp(catalog::sd.str(x.file), file)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The SD card's firmwares are a list in memory (catalog::sd: a few). The Hub's are 700 or so: too many to keep here
+// (catalog::keepHub is off), so its list stays on the SD card (HUB_LIST): what's found is where each one's line is, and
+// only the rows on screen are read
 struct FirmwaresPage : Page {
   bool hub;
-  std::string q;  // what's typed: the rows with it in their name, author or file
-  std::vector<int> rows;
+  std::string q;               // what's typed: the rows with it in their name, author or file
+  std::vector<uint32_t> rows;  // the SD card's: indexes in catalog::sd; the Hub's: where their lines are
+  struct Shown {
+    std::string name, version, file;
+    uint8_t flags;
+  };
+  std::vector<std::pair<uint32_t, Shown>> shown;  // the Hub's rows read so far (only those near the screen)
+  FILE* hubFile = 0;                              // HUB_LIST, open while the page is (opening it is slow)
   uint32_t seen = 0xFFFFFFFF;
   size_t seenSize = 0;
   int sel = 0, scroll = 0;
-  FirmwaresPage(bool hub) : hub(hub) {}
+  FirmwaresPage(bool hub) : hub(hub) { autoUpdate(); }
+  // Settings > Update the Hub list: the first time it's looked at after power-on, as fm1buddy does (not while
+  // Bluetooth MIDI runs: Wi-Fi would pause it)
+  void autoUpdate() {
+    static bool asked;
+    if (hub && settings.hubAuto && !asked && settings.ssid[0] && hal::sd() && !(midi::routing && hal::bleIsOn())) {
+      asked = true;
+      jobs::hubList(false);
+    }
+  }
+  ~FirmwaresPage() { closeHub(); }
+  void closeHub() {
+    if (hubFile) {
+      fclose(hubFile);
+      hubFile = 0;
+    }
+  }
 
-  FwList& list() { return hub ? catalog::hub : catalog::sd; }
   const char* title() override { return hub ? "Firmware: Hub" : "Firmware: SD card"; }
   const char* hints() override {
-    return hub ? "type to find  tab SD  u update" : "type to find  tab Hub  enter open";
+    return hub ? "type to find  tab SD  u update" : "type to find  tab Hub";
   }
-  bool typing() override { return false; }
   bool closing() override {
     if (!q.empty()) {
       q.clear();
@@ -161,24 +203,77 @@ struct FirmwaresPage : Page {
     }
     return true;
   }
+  static bool matches(const FwList& l, const FwItem& it, const std::string& q) {
+    return has(l.str(it.name), q) || has(l.str(it.author), q) || has(l.str(it.file), q);
+  }
   void filter() {
-    FwList& l = list();
     rows.clear();
-    for (size_t i = 0; i < l.size(); i++) {
-      const FwItem& it = l[i];
-      if (has(l.str(it.name), q) || has(l.str(it.author), q) || has(l.str(it.file), q)) {
-        rows.push_back(i);
+    shown.clear();
+    closeHub();  // (it may be a new list)
+    if (hub) {
+      catalog::eachHub([](const FwList& one, void* arg) {
+        FirmwaresPage* p = (FirmwaresPage*)arg;
+        if (matches(one, one[0], p->q)) {
+          p->rows.push_back(one[0].line);
+        }
+        return true;
+      },
+                       this);
+    } else {
+      for (size_t i = 0; i < catalog::sd.size(); i++) {
+        if (matches(catalog::sd, catalog::sd[i], q)) {
+          rows.push_back(i);
+        }
       }
     }
     sel = std::min(sel, std::max(0, (int)rows.size() - 1));
     seen = FwList::changes;
-    seenSize = l.size();
+    seenSize = catalog::sd.size();
+  }
+  // the Hub's row i: read with the screen's worth after it, the first time it's needed
+  const Shown& hubRow(int i) {
+    uint32_t line = rows[i];
+    for (auto& s : shown) {
+      if (s.first == line) {
+        return s.second;
+      }
+    }
+    if (shown.size() > 60) {
+      shown.clear();
+    }
+    if (!hubFile) {
+      hubFile = catalog::openHub();
+    }
+    FwList one;
+    for (int k = i; k < (int)rows.size() && k < i + 12; k++) {
+      Shown r{"?", "", "", 0};
+      if (catalog::hubAt(hubFile, rows[k], one)) {
+        r = {one.str(one[0].name), one.str(one[0].version), one.str(one[0].file), one[0].flags};
+      }
+      shown.push_back({rows[k], r});
+    }
+    return shown[shown.size() - std::min<int>(12, rows.size() - i)].second;
   }
   void tick() override {
-    if (seen != FwList::changes || seenSize != list().size()) {
+    if (seen != FwList::changes || seenSize != catalog::sd.size()) {
       filter();
       redraw();
     }
+  }
+  void open() {
+    Firmware f;
+    if (hub) {
+      FwList one;
+      if (!catalog::hubAt(rows[sel], one)) {
+        toast("Can't read it from the SD card.", true);
+        return;
+      }
+      f = catalog::details(one, 0);
+      f.onSd = onSd(f.file.c_str());
+    } else {
+      f = catalog::details(catalog::sd, rows[sel]);
+    }
+    push(new FirmwarePage(f, hub));
   }
   void key(const Key& k) override {
     int n = rows.size();
@@ -189,40 +284,36 @@ struct FirmwaresPage : Page {
     } else if (k.left) {
       sel = std::max(0, sel - 8);
     } else if (k.right) {
-      sel = std::min(n - 1, sel + 8);
+      sel = std::max(0, std::min(n - 1, sel + 8));
     } else if (k.tab) {
       hub = !hub;
       sel = scroll = 0;
       filter();
+      autoUpdate();
     } else if (k.del && !q.empty()) {
       q.pop_back();
       filter();
     } else if (k.enter && n) {
-      push(new FirmwarePage(catalog::details(list(), rows[sel]), hub));
+      open();
     } else if (k.ch == 'u' && hub && q.empty()) {
       if (!settings.ssid[0]) {
-        toast("Set up Wi-Fi first (home > Wi-Fi).", true);
+        toast("Set up Wi-Fi first (Settings > Wi-Fi).", true);
       } else if (!jobs::hubList()) {
         toast("Busy with something else.", true);
       }
-    } else if (k.ch && k.ch != ' ' && !(k.ch == 'u' && hub && q.empty())) {
+    } else if (k.ch) {
       q += k.ch;
       sel = 0;
-      filter();
-    } else if (k.ch == ' ') {
-      q += ' ';
       filter();
     }
   }
   void jobDone() override {
     if (jobs::kind == jobs::HUB && jobs::ok) {
       toast("The Hub's list is up to date.");
+      filter();
     }
   }
   void draw() override {
-    if (seen != FwList::changes) {
-      filter();
-    }
     int y0 = TOP + 2;
     if (!q.empty()) {
       std::string s = "find: " + q + "_";
@@ -239,14 +330,24 @@ struct FirmwaresPage : Page {
     }
     listRows(rows.size(), sel, scroll, y0, (BOTTOM - y0) / ROW, [](int i, int y, bool s, void* arg) {
       FirmwaresPage* p = (FirmwaresPage*)arg;
-      FwList& l = p->list();
-      const FwItem& it = l[p->rows[i]];
-      uint8_t mark = (it.flags & FwItem::ON_SD) && p->hub ? GOOD : (it.flags & FwItem::BETA) ? WARN : 0;
+      const char *name, *version;
+      bool there, beta;
+      if (p->hub) {
+        const Shown& r = p->hubRow(i);
+        name = r.name.c_str(), version = r.version.c_str();
+        there = onSd(r.file.c_str()), beta = r.flags & FwItem::BETA;
+      } else {
+        const FwList& l = catalog::sd;
+        const FwItem& it = l[p->rows[i]];
+        name = l.str(it.name), version = l.str(it.version);
+        there = false, beta = it.flags & FwItem::BETA;
+      }
+      uint8_t mark = there ? GOOD : beta ? WARN : 0;
       if (mark) {
         fill(4, y + 4, 3, 3, mark);
       }
-      text(10, y + 2, l.str(it.name), s ? TEXT : DIM, 150);
-      textRight(SCREEN_W - 6, y + 2, l.str(it.version), s ? DIM : OFF); }, this);
+      text(10, y + 2, name, s ? TEXT : DIM, 150);
+      textRight(SCREEN_W - 6, y + 2, version, s ? DIM : OFF); }, this);
   }
 };
 
@@ -259,7 +360,7 @@ Page* ui::firmwarePage(bool hub) {
 // ------------------------------------------------------------------------------------------- text entry ---
 struct TextPage : Page {
   const char* t;
-  const char* prompt;
+  std::string prompt;  // (a copy: it's often made on the spot)
   bool secret, shown = false;
   std::string s;
   void (*done)(const std::string&, void*);
@@ -267,7 +368,7 @@ struct TextPage : Page {
   TextPage(const char* t, const char* prompt, bool secret, void (*done)(const std::string&, void*), void* arg)
       : t(t), prompt(prompt), secret(secret), done(done), arg(arg) {}
   const char* title() override { return t; }
-  const char* hints() override { return secret ? "enter ok  tab show  fn+` back" : "enter ok  fn+` back"; }
+  const char* hints() override { return "enter ok  fn+esc back"; }
   bool typing() override { return true; }
   void key(const Key& k) override {
     if (k.enter) {
@@ -285,10 +386,13 @@ struct TextPage : Page {
     }
   }
   void draw() override {
-    wrap(6, TOP + 6, SCREEN_W - 12, prompt, DIM, 3);
+    wrap(6, TOP + 6, SCREEN_W - 12, prompt.c_str(), DIM, 3);
     fill(4, TOP + 40, SCREEN_W - 8, 16, PANEL);
     std::string v = secret && !shown ? std::string(s.size(), '*') : s;
     text(8, TOP + 44, (v + "_").c_str(), TEXT, SCREEN_W - 16);
+    if (secret) {
+      text(6, TOP + 62, shown ? "tab: hide password" : "tab: show password", DIM);
+    }
   }
 };
 
@@ -305,7 +409,7 @@ struct WifiPage : Page {
   bool scanned = false;
   WifiPage() { jobs::scan(); }
   const char* title() override { return "Wi-Fi"; }
-  const char* hints() override { return "enter join  r scan again  ` back"; }
+  const char* hints() override { return "enter join  r scan again  esc back"; }
   void key(const Key& k) override {
     int n = aps.size();
     if (k.up && n) {
@@ -368,49 +472,66 @@ Page* ui::wifiPage() {
 
 // ----------------------------------------------------------------------------------------------- settings ---
 struct SettingsPage : Page {
+  enum { WIFI,
+         THEME,
+         BRIGHTNESS,
+         HUB_AUTO,
+         BLUETOOTH,
+         COMPUTER,
+         N };
   int sel = 0;
-  static const int N = 6;
   const char* title() override { return "Settings"; }
-  const char* hints() override { return "; . move  , / enter change  ` back"; }
+  const char* hints() override { return sel == WIFI ? "esc back" : "< > change  esc back"; }
   void key(const Key& k) override {
     if (k.up) {
       sel = (sel + N - 1) % N;
-    } else if (k.down) {
+      return;
+    }
+    if (k.down) {
       sel = (sel + 1) % N;
-    } else if (k.left || k.right || k.enter) {
-      int d = k.left ? -1 : 1;
-      if (sel == 0) {
+      return;
+    }
+    if (!k.left && !k.right && !k.enter) {
+      return;
+    }
+    int d = k.left ? -1 : 1;
+    switch (sel) {
+      case WIFI:
+        if (k.enter) {
+          push(wifiPage());
+        }
+        return;
+      case THEME:
         settings.theme = (settings.theme + THEME_COUNT + d) % THEME_COUNT;
-      } else if (sel == 1) {
+        break;
+      case BRIGHTNESS:
         settings.brightness = std::max(10, std::min(100, settings.brightness + d * 10));
-      } else if (sel == 2) {
+        break;
+      case HUB_AUTO:
         settings.hubAuto = !settings.hubAuto;
-      } else if (sel == 3) {
+        break;
+      case BLUETOOTH: {
         hal::bleOn(!hal::bleIsOn());
         bool on = hal::bleIsOn();
         hal::save("bluetooth", &on, 1);
-      } else if (sel == 4) {
-        hal::computerMidiSet(!hal::computerMidi());  // (it restarts, if a computer is on the port)
-      } else if (sel == 5 && k.enter) {
-        if (!hal::sd() || jobs::running) {
-          toast(hal::sd() ? "Busy with something else." : "No SD card.", true);
-        } else {
-          hal::diskModeSet(true);  // (it restarts as a USB disk)
-        }
+        return;
       }
-      settingsSave();
-      applyTheme();
+      case COMPUTER:
+        hal::computerMidiSet(!hal::computerMidi());  // (it restarts, if a computer is on the port)
+        return;
     }
+    settingsSave();
+    applyTheme();
   }
   void draw() override {
-    char b[N][24];
-    snprintf(b[0], 24, "%s", THEMES[settings.theme % THEME_COUNT].name);
-    snprintf(b[1], 24, "%d%%", settings.brightness);
-    snprintf(b[2], 24, "%s", settings.hubAuto ? "on" : "off");
-    snprintf(b[3], 24, "%s", hal::bleIsOn() ? "on" : "off");
-    snprintf(b[4], 24, "%s", hal::computerMidi() ? "USB MIDI" : "serial");
-    snprintf(b[5], 24, "enter");
-    const char* names[N] = {"Theme", "Brightness", "Update the Hub list", "Bluetooth MIDI", "On a computer", "USB disk (SD card)"};
+    char b[N][34];
+    snprintf(b[WIFI], 34, "%s", settings.ssid[0] ? settings.ssid : "none");
+    snprintf(b[THEME], 34, "%s", THEMES[settings.theme % THEME_COUNT].name);
+    snprintf(b[BRIGHTNESS], 34, "%d%%", settings.brightness);
+    snprintf(b[HUB_AUTO], 34, "%s", settings.hubAuto ? "on" : "off");
+    snprintf(b[BLUETOOTH], 34, "%s", hal::bleIsOn() ? "on" : "off");
+    snprintf(b[COMPUTER], 34, "%s", hal::computerMidi() ? "USB MIDI" : "serial");
+    const char* names[N] = {"Wi-Fi", "Theme", "Brightness", "Hub list at power-on", "Bluetooth MIDI", "On a computer"};
     for (int i = 0; i < N; i++) {
       int y = TOP + 2 + i * ROW;
       if (i == sel) {
@@ -433,7 +554,7 @@ Page* ui::settingsPage() {
 // -------------------------------------------------------------------------------------------------- about ---
 struct AboutPage : Page {
   const char* title() override { return "About"; }
-  const char* hints() override { return "` back"; }
+  const char* hints() override { return "esc back"; }
   void key(const Key&) override {}
   void tick() override {
     static uint32_t t;

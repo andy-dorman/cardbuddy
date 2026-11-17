@@ -19,17 +19,18 @@ It runs fm1buddy's own core (`lib/fm1core` there), so it does the same things th
 
 All of it through fm1buddy's own code (`lib/fm1core`, and `lib/fm1s3` for the ESP32-S3's USB host, Bluetooth and Wi-Fi):
 
-- **Firmware**: the SD card's `.fwsc` files and the Hub's ([mutant.cloud](https://mutant.cloud/)), with search. Download from the Hub over Wi-Fi, install on the FM-1 (`i`), with a warning when there's no backup yet
+- **Firmware**: the SD card's `.fwsc` files and the Hub's ([mutant.cloud](https://mutant.cloud/)), with search. Download from the Hub over Wi-Fi, install on the FM-1 (`enter` on a firmware)
 - **Backup & recover**: all of the FM-1's flash to `/backups`, and an FM-1 that won't start brought back from a firmware or a backup (recovery mode: the FM-1 straight on the USB-C port, the flash map drawn as it goes, on both screens)
 - **Sounds**: send `.syx` files, save the stock firmware's voice, keep and load fomajam's song and kits (setups), export them
 - **SLOOP**: back it up, restore a backup or one project of it (`0`, `a`-`d`), save and load songs, load `.wav` files into a sample slot (`1`-`4`)
 - **MIDI**: the devices on the hub, routing between them (`r`, with `/midimap.txt`), Bluetooth MIDI (`b`)
 - **Keys**: the keyboard as a MIDI controller, two octaves as trackers lay them out (`z s x d c v`... and `q 2 w 3 e r`...), `-` `=` octave, `[` `]` channel
-- **Settings**: theme, brightness, Bluetooth MIDI, USB MIDI on a computer, USB disk (the SD card as a computer's drive)
+- **USB disk**: the SD card as a computer's drive; it goes back by itself once it's ejected there
+- **Settings**: Wi-Fi, theme, brightness, Bluetooth MIDI, USB MIDI on a computer
 
 ## Using it
 
-- `;` `.` move up and down, `,` `/` page (left and right), `enter` opens, `` ` `` goes back (`fn` + these while typing)
+- The arrows (`;` `.` `,` `/`, labelled on the keyboard) move, `enter` opens, `esc` goes back (`fn` + these while typing)
 - In a firmware list, just type to find one; `tab` switches between the SD card's and the Hub's
 - The FM-1 and controllers go on the USB-C port through a powered USB hub (or an OTG adapter with a charging port), as with fm1buddy. For recovery, the FM-1 goes straight on the port, and cardbuddy says when to switch it on
 - With a computer on the USB-C port at power-on, the port is its serial port (flashing, logs) instead

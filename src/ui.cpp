@@ -14,8 +14,12 @@
 #include "settings.h"
 #include "themes.h"
 
-// the whole screen, 4 bits a pixel: 16 KB of the internal RAM, where 16 bits would take 64 KB
+// The screen is drawn a band of BAND rows at a time, into one band's canvas (4 bits a pixel, the theme's palette: 1.8
+// KB), each pushed as it's done: the whole screen's would take 16 KB of the internal RAM, which TLS needs (no PSRAM).
+// Everything drawn is moved up by bandY, so what's outside the band falls off it
+#define BAND 15
 static M5Canvas canvas(&M5Cardputer.Display);
+static int bandY;
 static std::vector<ui::Page*> stack;
 static bool dirty = true;
 static std::string toastText;
@@ -45,7 +49,7 @@ void jobs::screenColors(uint32_t rgb[SCREEN_COLORS]) {
 
 // -------------------------------------------------------------------------------------------- drawing ---
 void ui::fill(int x, int y, int w, int h, uint8_t color) {
-  canvas.fillRect(x, y, w, h, color);
+  canvas.fillRect(x, y - bandY, w, h, color);
 }
 
 void ui::text(int x, int y, const char* s, uint8_t color, int maxW) {
@@ -56,21 +60,21 @@ void ui::text(int x, int y, const char* s, uint8_t color, int maxW) {
       t.pop_back();
     }
     t += "~";
-    canvas.drawString(t.c_str(), x, y);
+    canvas.drawString(t.c_str(), x, y - bandY);
     return;
   }
-  canvas.drawString(s, x, y);
+  canvas.drawString(s, x, y - bandY);
 }
 
 void ui::textRight(int x, int y, const char* s, uint8_t color) {
   canvas.setTextColor(color);
-  canvas.drawString(s, x - canvas.textWidth(s), y);
+  canvas.drawString(s, x - canvas.textWidth(s), y - bandY);
 }
 
 void ui::bar(int x, int y, int w, int h, uint32_t done, uint32_t total) {
-  canvas.fillRect(x, y, w, h, OFF);
+  fill(x, y, w, h, OFF);
   if (total) {
-    canvas.fillRect(x, y, (int)((uint64_t)w * std::min(done, total) / total), h, ACCENT);
+    fill(x, y, (int)((uint64_t)w * std::min(done, total) / total), h, ACCENT);
   }
 }
 
@@ -120,6 +124,9 @@ void ui::listRows(int count, int sel, int& scroll, int y0, int rows, void (*row)
   scroll = std::max(0, std::min(scroll, std::max(0, count - rows)));
   for (int i = scroll; i < count && i < scroll + rows; i++) {
     int y = y0 + (i - scroll) * ROW;
+    if (y + ROW <= bandY || y >= bandY + BAND) {
+      continue;  // (not in the band being drawn)
+    }
     if (i == sel) {
       fill(0, y, SCREEN_W - 3, ROW, OFF);
       fill(0, y, 2, ROW, ACCENT);
@@ -134,7 +141,8 @@ void ui::listRows(int count, int sel, int& scroll, int y0, int rows, void (*row)
   }
 }
 
-static void drawFrame() {
+// one band of the screen (from bandY) into the canvas
+static void drawBand() {
   using namespace ui;
   canvas.fillScreen(BG);
   Page* p = stack.back();
@@ -161,7 +169,15 @@ static void drawFrame() {
   } else {
     text(3, BOTTOM + 3, p->hints(), DIM, SCREEN_W - 6);
   }
-  canvas.pushSprite(0, 0);
+}
+
+static void drawFrame() {
+  for (bandY = 0; bandY < SCREEN_H; bandY += BAND) {
+    drawBand();
+    // (the display named here: a global M5Canvas is made before M5Cardputer is)
+    canvas.pushSprite(&M5Cardputer.Display, 0, bandY);
+  }
+  bandY = 0;
 }
 
 // ------------------------------------------------------------------------------------------- the pages ---
@@ -213,8 +229,9 @@ static void bootBegin() {
   hal::spawn(
       [](void*) {
         std::string err;
-        if (!catalog::loadHub(bootHub, bootUpdated)) {
-          catalog::parseHub(bootHub, bootUpdated, err);
+        // (the Hub's list stays on the SD card: catalog::keepHub is off. One left half-read is finished)
+        if (!catalog::hubWhen(bootUpdated)) {
+          catalog::writeHub(bootUpdated, err);
         }
         bootUnknown = catalog::scanSdInto(bootHub, bootSd);
         hal::log("boot: hub %u firmwares, sd %u", (unsigned)bootHub.size(), (unsigned)bootSd.size());
@@ -275,7 +292,32 @@ static void watch() {
 }
 
 // ------------------------------------------------------------------------------------------ the keyboard ---
+static std::vector<ui::Key> injected;
+
+void ui::inject(const Key& k) {
+  injected.push_back(k);
+}
+
+void ui::shot(void (*row)(const uint16_t* px, int n)) {
+  std::vector<uint16_t> line(SCREEN_W);
+  for (bandY = 0; bandY < SCREEN_H; bandY += BAND) {
+    drawBand();
+    for (int y = 0; y < BAND && bandY + y < SCREEN_H; y++) {
+      for (int x = 0; x < SCREEN_W; x++) {
+        line[x] = canvas.readPixel(x, y);
+      }
+      row(line.data(), SCREEN_W);
+    }
+  }
+  bandY = 0;
+}
+
 static bool readKey(ui::Key& k) {
+  if (!injected.empty()) {
+    k = injected.front();
+    injected.erase(injected.begin());
+    return true;
+  }
   if (!M5Cardputer.Keyboard.isChange()) {
     return false;
   }
@@ -289,11 +331,14 @@ static bool readKey(ui::Key& k) {
   }
   k = {};
   k.enter = s.enter;
-  k.del = s.del;
+  k.del = s.backspace || s.del;  // (the del key is backspace; fn+del, forward delete)
   k.tab = s.tab;
+  // fn with ` ; . , /: esc and the arrows (the library says so itself)
+  k.back = s.esc;
+  k.up = s.up, k.down = s.down, k.left = s.left, k.right = s.right;
   bool typing = stack.back()->typing();
   for (char c : s.word) {
-    bool nav = s.fn || !typing;
+    bool nav = !typing;  // (nothing being typed: ` ; . , / alone are esc and the arrows too)
     if (nav && c == ';') {
       k.up = true;
     } else if (nav && c == '.') {
@@ -312,9 +357,10 @@ static bool readKey(ui::Key& k) {
 }
 
 void ui::begin() {
+  catalog::keepHub = false;  // (the Hub's list, ~100 KB, stays on the SD card: read as it's needed)
   settingsLoad();
   canvas.setColorDepth(4);
-  canvas.createSprite(SCREEN_W, SCREEN_H);
+  canvas.createSprite(SCREEN_W, BAND);
   canvas.createPalette();
   canvas.setFont(&fonts::Font0);
   canvas.setTextSize(1);
@@ -346,9 +392,28 @@ void ui::begin() {
   }
 }
 
+// an arrow held: it goes again after a moment, and faster the longer it's held (8 a second, up to 40)
+static ui::Key held;
+static uint32_t heldAt, nextAt;
+
+static bool arrow(const ui::Key& k) {
+  return (k.up || k.down || k.left || k.right) && !k.ch && !k.enter && !k.back && !k.del && !k.tab;
+}
+
 void ui::loop() {
   Key k;
-  if (readKey(k)) {
+  bool got = readKey(k);
+  uint32_t now = hal::millis();
+  if (got) {
+    held = arrow(k) && !stack.back()->raw() ? k : Key{};
+    heldAt = now, nextAt = now + 350;
+  } else if (arrow(held) && M5Cardputer.Keyboard.isPressed() && (int32_t)(now - nextAt) >= 0) {
+    k = held, got = true;
+    nextAt = now + std::max<uint32_t>(25, 125 - (now - heldAt) / 20);
+  } else if (!M5Cardputer.Keyboard.isPressed()) {
+    held = {};
+  }
+  if (got) {
     Page* p = stack.back();
     if (k.back && p->closing()) {
       pop();

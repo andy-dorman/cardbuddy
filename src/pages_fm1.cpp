@@ -150,7 +150,7 @@ struct AskPage : Page {
   std::function<void()> yes;
   AskPage(const std::string& t, const std::string& q, std::function<void()> yes) : t(t), q(q), yes(yes) {}
   const char* title() override { return t.c_str(); }
-  const char* hints() override { return "y yes  ` no"; }
+  const char* hints() override { return "y yes  esc no"; }
   void key(const Key& k) override {
     if (k.ch == 'y' || k.ch == 'Y') {
       auto f = yes;
@@ -165,37 +165,13 @@ static void ask(const std::string& t, const std::string& q, std::function<void()
   push(new AskPage(t, q, yes));
 }
 
-static bool hasBackup() {
-  std::string dir = catalog::path(BACKUPS_DIR);
-  DIR* d = dir.empty() ? 0 : opendir(dir.c_str());
-  bool any = false;
-  while (dirent* e = d ? readdir(d) : 0) {
-    size_t n = strlen(e->d_name);
-    any |= n > 4 && !strcasecmp(e->d_name + n - 4, ".bin");
-  }
-  if (d) {
-    closedir(d);
-  }
-  return any;
-}
-
 // install f on the FM-1 (the firmware page's i)
 void ui::install(const Firmware& f) {
-  const Fm1Id* id = fm1::known(fm1::current());
-  if (!id) {
+  if (!fm1::known(fm1::current())) {
     toast("No FM-1 on the USB-C port.", true);
-    return;
+  } else if (!jobs::install(f)) {
+    busy();
   }
-  std::string q = "Install " + f.name + " " + f.version + " on the " + fm1::machineName() + " (" + id->text + ")?";
-  if (!hasBackup()) {
-    q += " There's no backup of it on the SD card yet (Backup & recover).";
-  }
-  Firmware copy = f;
-  ask("Install", q, [copy]() {
-    if (!jobs::install(copy)) {
-      busy();
-    }
-  });
 }
 
 // --------------------------------------------------------------------------------- backup & recover ---
@@ -235,7 +211,7 @@ static std::vector<Choice> choices() {
 }
 
 struct BackupPage : ListPage {
-  BackupPage() : ListPage("Backup & recover", "enter go  ; . move  ` back") {
+  BackupPage() : ListPage("Backup & recover", "esc back") {
     fill = [](ListPage& p) {
       int d = fm1::current();
       const Fm1Id* id = fm1::known(d);
@@ -365,18 +341,19 @@ Page* ui::recoverPage() {
 // USB disk mode: the SD card is a computer's drive
 struct DiskPage : Page {
   const char* title() override { return "USB disk"; }
-  const char* hints() override { return "enter done"; }
+  const char* hints() override { return "eject it on the computer to go back"; }
   bool closing() override { return false; }
-  void key(const Key& k) override {
-    if (k.enter) {
-      hal::diskModeSet(false);
+  void key(const Key&) override {}
+  void tick() override {
+    if (hal::diskState() == hal::DISK_EJECTED) {
+      hal::diskModeSet(false);  // (ejected: back as it was, by itself)
     }
+    redraw();
   }
-  void tick() override { redraw(); }
   void draw() override {
     int s = hal::diskState();
     const char* what = s == hal::DISK_MOUNTED   ? "A computer has the SD card. Eject it there before you're done."
-                       : s == hal::DISK_EJECTED ? "Ejected: it's safe. Enter to go back."
+                       : s == hal::DISK_EJECTED ? "Ejected: back in a moment."
                                                 : "Plug the Cardputer into a computer: the SD card shows up as a drive.";
     wrap(6, TOP + 6, SCREEN_W - 12, what, s == hal::DISK_EJECTED ? GOOD : TEXT, 6);
   }
@@ -395,7 +372,7 @@ static Page* setupsPage();
 static Page* sloopPage();
 
 static Page* syxPage(const std::string& folder) {
-  ListPage* p = new ListPage(folder.empty() ? "Sounds: /syx" : "/syx/" + folder, "enter send  ` back");
+  ListPage* p = new ListPage(folder.empty() ? "Sounds: /syx" : "/syx/" + folder, "enter send  esc back");
   p->empty = "No .syx files here (" SYX_DIR " on the SD card).";
   p->fill = [folder](ListPage& p) {
     for (const sounds::File& f : sounds::list(folder)) {
@@ -426,7 +403,7 @@ static Page* syxPage(const std::string& folder) {
 }
 
 static Page* setupsPage() {
-  ListPage* p = new ListPage("Setups", "enter load  e export  ` back");
+  ListPage* p = new ListPage("Setups", "enter load  e export  esc back");
   p->empty = "No setups yet: Sounds > Keep its song and kits.";
   p->fill = [](ListPage& p) {
     for (const std::string& s : sounds::setups()) {
@@ -456,7 +433,7 @@ static Page* setupsPage() {
 }
 
 struct SoundsPage : ListPage {
-  SoundsPage() : ListPage("Sounds", "enter go  p ask again  ` back") {
+  SoundsPage() : ListPage("Sounds", "p ask again  esc back") {
     fill = [](ListPage& p) {
       int d = device();
       if (d < 0) {
@@ -514,7 +491,7 @@ Page* ui::soundsPage() {
 // ----------------------------------------------------------------------------------------------- SLOOP ---
 static Page* sloopFiles(bool songs) {
   ListPage* p = new ListPage(songs ? "SLOOP: songs" : "SLOOP: backups",
-                             songs ? "enter load  ` back" : "enter restore  0 a-d project  ` back");
+                             songs ? "enter load  esc back" : "enter restore  0 a-d project  esc back");
   p->empty = songs ? "No songs in " SLOOP_SONGS_DIR "." : "No backups in " SLOOP_DIR ".";
   p->fill = [songs](ListPage& p) {
     for (const std::string& f : songs ? sloop::songs() : sloop::backups()) {
@@ -551,7 +528,7 @@ static Page* sloopFiles(bool songs) {
 }
 
 static Page* sloopSamples() {
-  ListPage* p = new ListPage("SLOOP: samples", "1-4 into that slot  ` back");
+  ListPage* p = new ListPage("SLOOP: samples", "1-4 into that slot  esc back");
   p->empty = "No .wav files or folders of them in " SLOOP_DIR "/samples.";
   p->fill = [](ListPage& p) {
     for (const std::string& s : sloop::sampleSources()) {
@@ -574,7 +551,7 @@ static Page* sloopSamples() {
 }
 
 static Page* sloopPage() {
-  ListPage* p = new ListPage("SLOOP", "enter go  ` back");
+  ListPage* p = new ListPage("SLOOP", "esc back");
   p->fill = [](ListPage& p) {
     p.rows.push_back({"Back it up", SLOOP_DIR, []() {
                         if (!jobs::sloopBackup(device())) {
@@ -605,7 +582,7 @@ static void saveFlag(const char* key, bool on) {
 }
 
 struct MidiPage : ListPage {
-  MidiPage() : ListPage("MIDI", "r routing  b bluetooth  k keys  ` back") {
+  MidiPage() : ListPage("MIDI", "r routing  b bluetooth  k keys  esc back") {
     fill = [](ListPage& p) {
       midi::Dev v;
       for (int d = 0; d < MIDI_DEVS; d++) {
@@ -673,8 +650,8 @@ struct KeysPage : Page {
   int octave = 4, channel = 0;
   bool down[128] = {};
   const char* title() override { return "Keys"; }
-  const char* hints() override { return "- = octave  [ ] channel  fn+` back"; }
-  bool typing() override { return true; }  // (every key is a note: fn for the arrows, and back)
+  const char* hints() override { return "- = octave  [ ] channel  esc back"; }
+  bool typing() override { return false; }  // (esc goes back; the notes come from held(), every key as it is)
   bool raw() override { return true; }
   KeysPage() {
     midi::route(true);

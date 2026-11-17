@@ -32,7 +32,7 @@ enum Color : uint8_t { BG,
 struct Page {
   virtual ~Page() {}
   virtual const char* title() = 0;
-  virtual const char* hints() { return "; . move  enter open  ` back"; }
+  virtual const char* hints() { return "esc back"; }
   virtual bool typing() { return false; }  // keys are text (the arrows need Fn)
   virtual void key(const Key& k) = 0;
   virtual void draw() = 0;                 // the body: y from TOP to BOTTOM
@@ -55,6 +55,9 @@ void replace(Page* p);
 void redraw();
 void toast(const std::string& text, bool bad = false);
 void applyTheme();
+// testing from the serial console (main.cpp): a key as if pressed, and the screen as RGB565 pixels (row by row)
+void inject(const Key& k);
+void shot(void (*row)(const uint16_t* px, int n));
 
 // drawing into the body
 void text(int x, int y, const char* s, uint8_t color, int maxW = 0);
