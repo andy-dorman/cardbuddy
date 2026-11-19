@@ -9,6 +9,6 @@
   },
   "files": {
     "firmware": "./cardbuddy.bin",
-    "cover": "./cardbuddy.png"
+    "cover": "./icon.png"
   }
 }
