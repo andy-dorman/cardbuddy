@@ -38,7 +38,8 @@ jobs:
       - run: pio run
         env:
           PLATFORMIO_BUILD_FLAGS: -D FM1BUDDY_VERSION='"${{ env.VERSION }}"'
-      - run: mkdir -p dist && cp .pio/build/cardputer/firmware.bin dist/cardbuddy.bin
+      # the merged image (boot loader, partitions, app) at 0x0: M5 Burner, M5 Launcher and the web installer all take it
+      - run: mkdir -p dist && cp .pio/build/cardputer/firmware.factory.bin dist/cardbuddy.bin
       - uses: actions/upload-artifact@v4
         with:
           name: cardbuddy
