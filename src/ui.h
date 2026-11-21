@@ -53,6 +53,7 @@ void push(Page* p);  // taken: deleted when it's popped
 void pop();
 void replace(Page* p);
 void redraw();
+bool scanning();  // the SD card's /fm1 is being read: the SD list is the last one, or none yet
 void toast(const std::string& text, bool bad = false);
 void applyTheme();
 // testing from the serial console (main.cpp): a key as if pressed, and the screen as RGB565 pixels (row by row)

@@ -13,9 +13,11 @@
 #define SD_MOSI 14
 #define SD_CS 12
 #define SD_GATE 5
-// files open at once: each takes a 4 KB buffer of the internal RAM from the start (5 by default). The most: a
-// firmware, its flash file, the log, and the Hub's list (its page open)
-#define SD_FILES 4
+// files open at once: each takes a 4 KB buffer of the internal RAM from the start (5 by default). The most: the Hub's
+// list and the SD list (the Hub page open, the UI drawing), and the background scan's folder, its new list and the
+// SHA cache: 5. No more: each slot more is 4 KB less for the TLS of a download (a sync closes its scan before the
+// downloads)
+#define SD_FILES 5
 
 bool port::sdBegin() {
   pinMode(SD_GATE, OUTPUT);

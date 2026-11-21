@@ -281,19 +281,10 @@ struct Choice {
   std::string path, name, what;
 };
 
-// what can go back on it: the SD card's firmwares for the FM-1 or the SMK-37, then the backups, newest first
+// the backups that can go back on it, newest first. The SD card's firmwares are too many for a list here: the page of
+// them (SdPickPage) reads them as they are on screen
 static std::vector<Choice> choices() {
   std::vector<Choice> out;
-  for (const FwItem& f : catalog::sd.items) {
-    const char* product = catalog::sd.str(f.product);
-    bool smk = isSmk(product);  // (it says what it's for: recovery checks the flash it finds)
-    if (!strncmp(product, "FM-1_", 5) || smk) {
-      const char *v = catalog::sd.str(f.version), *file = catalog::sd.str(f.file), *name = catalog::sd.str(f.name);
-      std::string what = f.flags & FwItem::STOCK ? "stock" : *v ? v
-                                                                : "firmware";
-      out.push_back({std::string(FW_DIR "/") + file, *name ? name : file, smk ? what + ", SMK-37" : what});
-    }
-  }
   std::string dir = catalog::path(BACKUPS_DIR);
   std::vector<Choice> found;
   if (DIR* d = dir.empty() ? 0 : opendir(dir.c_str())) {
@@ -342,6 +333,117 @@ static Page* dataSaves() {
   return p;
 }
 
+// the SD card's firmwares for the FM-1 or the SMK-37, to put on one that won't start. A row is a place in the SD list:
+// the rows near the screen are read, as on the Firmware page
+struct SdPickPage : Page {
+  struct Line {
+    uint32_t at;
+    std::string path, name, what;
+  };
+  std::vector<uint32_t> rows;
+  std::vector<Line> shown;
+  uint32_t seen = 0xFFFFFFFF;
+  int sel = 0, scroll = 0;
+  SdPickPage() { filter(); }
+  const char* title() override { return "Recover from the SD card"; }
+  const char* hints() override { return "enter recover  esc back"; }
+  static bool wanted(const FwList& one) {
+    const char* product = one.str(one[0].product);
+    return !strncmp(product, "FM-1_", 5) || isSmk(product);  // (it says what it's for: recovery checks the flash it finds)
+  }
+  void filter() {
+    rows.clear();
+    shown.clear();
+    FILE* f = 0;
+    FwList one;
+    if (catalog::openSd(f)) {
+      for (uint32_t i = 0, n = catalog::sdShown(); i < n; i++) {
+        if (catalog::sdAt(f, i, one) && wanted(one)) {
+          rows.push_back(i);
+        }
+      }
+      if (f) {
+        fclose(f);
+      }
+    }
+    sel = std::min(sel, std::max(0, (int)rows.size() - 1));
+    seen = FwList::changes;
+  }
+  const Line& line(int i) {
+    for (const Line& l : shown) {
+      if (l.at == rows[i]) {
+        return l;
+      }
+    }
+    if (shown.size() > 60) {
+      shown.clear();
+    }
+    FILE* f = 0;
+    if (!catalog::openSd(f)) {
+      f = 0;
+    }
+    FwList one;
+    for (int k = i; k < (int)rows.size() && k < i + 12; k++) {
+      Line l{rows[k], "", "?", ""};
+      if (catalog::sdAt(f, rows[k], one)) {
+        const FwItem& it = one[0];
+        const char *v = one.str(it.version), *file = one.str(it.file), *name = one.str(it.name);
+        bool smk = isSmk(one.str(it.product));
+        std::string what = it.flags & FwItem::STOCK ? "stock" : *v ? v
+                                                                   : "firmware";
+        l = {rows[k], std::string(FW_DIR "/") + file, *name ? name : file, smk ? what + ", SMK-37" : what};
+      }
+      shown.push_back(l);
+    }
+    if (f) {
+      fclose(f);
+    }
+    return shown[shown.size() - std::min<int>(12, rows.size() - i)];  // (the row i is the first of those read)
+  }
+  void tick() override {
+    if (seen != FwList::changes) {
+      filter();
+      redraw();
+    }
+  }
+  void key(const Key& k) override {
+    int n = rows.size();
+    if (k.up && n) {
+      sel = (sel + n - 1) % n;
+    } else if (k.down && n) {
+      sel = (sel + 1) % n;
+    } else if (k.enter && n) {
+      std::string path = line(sel).path, name = line(sel).name;
+      ask("Recover", "Put " + name +
+                         " on an FM-1 that won't start? cardbuddy restarts into recovery mode, "
+                         "then says what to do.",
+          [path]() {
+            if (!jobs::prepare(path)) {
+              busy();
+            }
+          });
+    }
+  }
+  void draw() override {
+    int y0 = TOP + 2;
+    if (ui::scanning()) {
+      text(4, y0, "Reading the SD card...", ACCENT, SCREEN_W - 8);
+      y0 += 11;
+    }
+    if (rows.empty()) {
+      if (!ui::scanning()) {
+        wrap(6, y0 + 4, SCREEN_W - 12, hal::sd() ? "Download a firmware (stock is on the Hub) first." : "No SD card.", DIM, 4);
+      }
+      return;
+    }
+    listRows(rows.size(), sel, scroll, y0, (BOTTOM - y0) / ROW, [](int i, int y, bool s, void* arg) {
+      SdPickPage* p = (SdPickPage*)arg;
+      const Line& l = p->line(i);
+      text(10, y + 2, l.name.c_str(), s ? TEXT : DIM, 120);
+      textRight(SCREEN_W - 6, y + 2, l.what.c_str(), s ? DIM : OFF); }, this);
+  }
+};
+
 struct BackupPage : ListPage {
   BackupPage() : ListPage("Backup & recover", "esc back") {
     fill = [](ListPage& p) {
@@ -355,13 +457,12 @@ struct BackupPage : ListPage {
                           }
                         }});
       p.rows.push_back({"Data saves", "put one back", []() { push(dataSaves()); }});
+      if (hal::sd()) {
+        p.rows.push_back({"Recover from the SD card", "firmwares", []() { push(new SdPickPage()); }});
+      }
       std::vector<Choice> cs = choices();
-      if (cs.empty()) {
-        p.rows.push_back({"Recover: nothing to put on it", hal::sd() ? "" : "no SD card", []() {
-                            toast(hal::sd() ? "Download a firmware (stock is on the Hub) or make a backup first."
-                                            : "No SD card.",
-                                  true);
-                          }});
+      if (cs.empty() && !hal::sd()) {
+        p.rows.push_back({"Recover: nothing to put on it", "no SD card", []() { toast("No SD card.", true); }});
       }
       for (const Choice& c : cs) {
         std::string path = c.path, name = c.name;
@@ -446,11 +547,21 @@ struct RecoverPage : Page {
   void draw() override {
     std::string from = jobs::recovering();
     std::string name = from.substr(from.rfind('/') + 1);
-    for (const FwItem& f : catalog::sd.items) {
-      if (name == catalog::sd.str(f.file) && *catalog::sd.str(f.name)) {
-        name = catalog::sd.str(f.name);
+    // the name the SD list gives it: looked for once for each list and file, not at each draw
+    static std::string seenFrom, seenName;
+    static uint32_t seenChanges = 0xFFFFFFFF;
+    if (seenChanges != FwList::changes || seenFrom != from) {
+      seenChanges = FwList::changes;
+      seenFrom = from;
+      seenName = name;
+      const std::string dir = FW_DIR "/";
+      FwList one;
+      int at = from.compare(0, dir.size(), dir) ? -1 : catalog::sdFind(from.c_str() + dir.size());
+      if (at >= 0 && catalog::sdAt(at, one) && *one.str(one[0].name)) {
+        seenName = one.str(one[0].name);
       }
     }
+    name = seenName;
     int st = jobs::step;
     bool onFlash = st == jobs::READING_FLASH || st == jobs::SAVING || st == jobs::WRITING_FLASH ||
                    st == jobs::CHECKING_FLASH || st == jobs::LEAVING;

@@ -217,56 +217,92 @@ void ui::toast(const std::string& s, bool bad) {
 }
 
 // --------------------------------------------------------------------------------------- the firmwares ---
-// at power-on, on a thread of its own: the Hub's list (its short copy, or the whole of it), then the SD card's .fwsc
-// files, as fm1buddy does (its ui.cpp bootBegin): the UI's thread takes them once they're there
-static FwList bootHub, bootSd;
+// The SD card's .fwsc files are read on a thread of their own (catalog::readSd), one scan at a time, as fm1buddy does
+// at power-on (its ui.cpp bootBegin): the UI's thread takes the result once it is there (catalog::takeSd). The first
+// scan reads the Hub's list on the SD card first. A scan asked for while one runs is made again when that one ends
+static FwList bootHub;
 static std::string bootUpdated;
-static std::atomic<bool> bootDone{false};
-static bool bootRunning, hubNew;
-static int bootUnknown;
+static catalog::SdScan scanResult;
+static std::atomic<bool> scanDone{false};
+static bool scanRunning, scanAgain, scanIsBoot, hubNew, updateDonePending;
+static uint32_t scanMs;
 
-static void bootBegin() {
+static void startScan(bool boot) {
+  scanRunning = true;
+  scanIsBoot = boot;
+  scanAgain = false;
+  scanDone = false;
+  hal::spawn(
+      [](void* arg) {
+        const bool boot = arg != 0;
+        if (boot) {
+          std::string err;
+          // (the Hub's list stays on the SD card: catalog::keepHub is off. One left half-read is finished)
+          if (!catalog::hubWhen(bootUpdated)) {
+            catalog::writeHub(bootUpdated, err);
+          }
+        }
+        uint32_t t0 = hal::millis();
+        scanResult = catalog::readSd(boot ? &bootHub : 0);
+        scanMs = hal::millis() - t0;
+        // (the Hub's count is in the Hub job's log: its list stays on the SD card, so bootHub is empty here)
+        hal::log("%s: sd %u (found %u, %u with no sha256), scan %u ms", boot ? "boot" : "scan",
+                 (unsigned)catalog::sdShown(&scanResult), (unsigned)catalog::sdFound(&scanResult),
+                 (unsigned)catalog::sdUnknown(&scanResult), (unsigned)scanMs);
+        hal::logRam(boot ? "boot scan" : "scan");
+        scanDone = true;
+      },
+      boot ? (void*)1 : (void*)0);
+}
+
+// a scan of /fm1 is wanted: now, or when the one that runs ends
+static void wantScan() {
   if (!hal::sd()) {
     return;
   }
-  bootRunning = true;
-  hal::spawn(
-      [](void*) {
-        std::string err;
-        // (the Hub's list stays on the SD card: catalog::keepHub is off. One left half-read is finished)
-        if (!catalog::hubWhen(bootUpdated)) {
-          catalog::writeHub(bootUpdated, err);
-        }
-        bootUnknown = catalog::scanSdInto(bootHub, bootSd);
-        hal::log("boot: hub %u firmwares, sd %u", (unsigned)bootHub.size(), (unsigned)bootSd.size());
-        bootDone = true;
-      },
-      0);
+  if (scanRunning) {
+    scanAgain = true;
+  } else {
+    startScan(false);
+  }
 }
 
-static void bootWatch() {
-  if (!bootRunning || !bootDone) {
+static void bootBegin() {
+  if (hal::sd()) {
+    startScan(true);
+  }
+}
+
+bool ui::scanning() {
+  return scanRunning;
+}
+
+// the UI's thread takes a scan that ended
+static void scanWatch() {
+  if (!scanRunning || !scanDone) {
     return;
   }
-  bootRunning = false;
-  if (hubNew) {
-    catalog::scanSd();
-  } else {
-    catalog::hub.swap(bootHub);
-    catalog::hubUpdated = bootUpdated;
-    catalog::sd.swap(bootSd);
+  scanRunning = false;
+  catalog::takeSd(scanResult);  // (it starts the task that reads the sha256 of the new files)
+  if (scanIsBoot) {
+    if (!hubNew) {
+      catalog::hub.swap(bootHub);
+      catalog::hubUpdated = bootUpdated;
+    }
+    FwList().swap(bootHub);
   }
-  FwList().swap(bootHub);
-  FwList().swap(bootSd);
-  if (bootUnknown) {
-    catalog::hashSd();
+  if (scanAgain) {
+    startScan(false);
+  } else if (updateDonePending) {
+    updateDonePending = false;
+    stack.back()->jobDone();  // (the page finds the new file in the SD list now)
   }
   dirty = true;
 }
 
 static void watch() {
-  if (!bootRunning && catalog::sdHashed()) {
-    catalog::scanSd();
+  if (catalog::sdHashed()) {
+    wantScan();
     dirty = true;
   }
   if (seenFinished != jobs::finished) {
@@ -276,9 +312,9 @@ static void watch() {
       FwList().swap(jobs::hub);
       hubNew = true;
       catalog::hubUpdated = jobs::hubUpdated;
-      catalog::scanSd();
+      wantScan();
     } else if (jobs::kind == jobs::DOWNLOAD || jobs::kind == jobs::INSTALL || jobs::kind == jobs::FW_UPDATE || jobs::kind == jobs::SYNC) {
-      catalog::scanSd();
+      wantScan();
     }
     if (jobs::kind == jobs::SYNC && !jobs::hubUpdated.empty()) {
       catalog::hubUpdated = jobs::hubUpdated;  // (the list it got first)
@@ -286,7 +322,11 @@ static void watch() {
     if (!jobs::ok && !jobs::error.empty()) {
       ui::toast(jobs::error, true);
     }
-    stack.back()->jobDone();
+    if (jobs::kind == jobs::FW_UPDATE && jobs::ok && scanRunning) {
+      updateDonePending = true;  // (its page looks for the new file: it waits for the new SD list)
+    } else {
+      stack.back()->jobDone();
+    }
     dirty = true;
   }
   fm1::watch();
@@ -295,7 +335,7 @@ static void watch() {
     fm1s |= fm1::known(d) ? 1u << d : 0;
   }
   play::skip(fm1s);
-  bootWatch();
+  scanWatch();
 }
 
 // ------------------------------------------------------------------------------------------ the keyboard ---
@@ -365,6 +405,7 @@ static bool readKey(ui::Key& k) {
 
 void ui::begin() {
   catalog::keepHub = false;  // (the Hub's list, ~100 KB, stays on the SD card: read as it's needed)
+  catalog::keepSd = false;   // (the SD list stays on the SD card too: a package long is ~100 bytes of memory)
   settingsLoad();
   canvas.setColorDepth(4);
   canvas.createSprite(SCREEN_W, BAND);

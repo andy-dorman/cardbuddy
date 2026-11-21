@@ -242,11 +242,10 @@ struct FirmwarePage : Page {
     } else if (jobs::kind == jobs::INSTALL && jobs::dataSaveFailed) {
       installAnyway(f);
     } else if (jobs::kind == jobs::FW_UPDATE && jobs::ok) {
-      for (size_t i = 0; i < catalog::sd.size(); i++) {
-        if (!strcasecmp(catalog::sd.str(catalog::sd[i].file), jobs::saved.c_str())) {
-          f = catalog::details(catalog::sd, i);  // (the new file)
-          break;
-        }
+      int at = catalog::sdFind(jobs::saved.c_str());
+      FwList one;
+      if (at >= 0 && catalog::sdAt(at, one)) {
+        f = catalog::details(one, 0);  // (the new file)
       }
       toast(f.version.empty() ? "Updated." : "Updated to v" + f.version + ".");
     }
@@ -277,31 +276,56 @@ struct FirmwarePage : Page {
 };
 
 // -------------------------------------------------------------------------------------- the firmwares ---
-// a firmware on the SD card with this file name (the Hub's: what's on the card already)
+// a firmware on the SD card with this file name (the Hub's: what's on the card already), in /fm1 or in a folder of it
+// (a sync puts a chip: old package in /fm1/old-chip). One file open and one read of the SD list when it is not what
+// the last call saw (a scan was taken): it keeps a hash of each file name without its folder (4 bytes a package),
+// because a draw asks for each row of the Hub
 static bool onSd(const char* file) {
-  for (const FwItem& x : catalog::sd.items) {
-    if (!strcasecmp(catalog::sd.str(x.file), file)) {
-      return true;
+  static std::vector<uint32_t> names;
+  static uint32_t seenChanges = 0xFFFFFFFF;
+  auto hash = [](const char* s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+      h = (h ^ (uint8_t)tolower((uint8_t)*s)) * 16777619u;
     }
+    return h;
+  };
+  if (seenChanges != FwList::changes) {
+    seenChanges = FwList::changes;
+    names.clear();
+    FILE* f = 0;
+    if (catalog::openSd(f)) {
+      FwList one;
+      for (size_t i = 0, n = catalog::sdShown(); i < n; i++) {
+        if (catalog::sdAt(f, i, one)) {
+          const char* path = one.str(one[0].file);  // (its path in /fm1: "old-chip/x.fwsc")
+          const char* slash = strrchr(path, '/');
+          names.push_back(hash(slash ? slash + 1 : path));
+        }
+      }
+      if (f) {
+        fclose(f);
+      }
+    }
+    std::sort(names.begin(), names.end());
   }
-  return false;
+  return std::binary_search(names.begin(), names.end(), hash(file));
 }
 
-// The SD card's firmwares are a list in memory (catalog::sd: a few). The Hub's are 700 or so: too many to keep here
-// (catalog::keepHub is off), so its list stays on the SD card (HUB_LIST): what's found is where each one's line is, and
-// only the rows on screen are read
+// The SD card's firmwares are 500 or more: too many to keep here (catalog::keepSd is off), so the SD list stays on the
+// SD card (SD_LIST), as does the Hub's 700 or so (catalog::keepHub is off, HUB_LIST): what's found is where each one
+// is, and only the rows on screen are read
 struct FirmwaresPage : Page {
   bool hub;
   std::string q;               // what's typed: the rows with it in their name, author or file
-  std::vector<uint32_t> rows;  // the SD card's: indexes in catalog::sd; the Hub's: where their lines are
+  std::vector<uint32_t> rows;  // the SD card's: places in the SD list (catalog::sdAt); the Hub's: where their lines are
   struct Shown {
     std::string name, version, file;
     uint8_t flags;
   };
-  std::vector<std::pair<uint32_t, Shown>> shown;  // the Hub's rows read so far (only those near the screen)
+  std::vector<std::pair<uint32_t, Shown>> shown;  // the rows read so far (only those near the screen)
   FILE* hubFile = 0;                              // HUB_LIST, open while the page is (opening it is slow)
   uint32_t seen = 0xFFFFFFFF;
-  size_t seenSize = 0;
   int sel = 0, scroll = 0;
   FirmwaresPage(bool hub) : hub(hub) { autoUpdate(); }
   // Settings > Update the Hub list: the first time it's looked at after power-on, as fm1buddy does (not while
@@ -361,18 +385,32 @@ struct FirmwaresPage : Page {
       },
                        this);
     } else {
-      for (size_t i = 0; i < catalog::sd.size(); i++) {
-        if (matches(catalog::sd, catalog::sd[i], q, device)) {
+      const uint32_t n = catalog::sdShown();
+      if (q.empty() && !device[0]) {
+        for (uint32_t i = 0; i < n; i++) {  // (all of them: no need to read any)
           rows.push_back(i);
+        }
+      } else {
+        FILE* f = 0;
+        FwList one;
+        if (catalog::openSd(f)) {
+          for (uint32_t i = 0; i < n; i++) {
+            if (catalog::sdAt(f, i, one) && matches(one, one[0], q, device)) {
+              rows.push_back(i);
+            }
+          }
+          if (f) {
+            fclose(f);
+          }
         }
       }
     }
     sel = std::min(sel, std::max(0, (int)rows.size() - 1));
     seen = FwList::changes;
-    seenSize = catalog::sd.size();
   }
-  // the Hub's row i: read with the screen's worth after it, the first time it's needed
-  const Shown& hubRow(int i) {
+  // row i: read with the screen's worth after it, the first time it's needed. The Hub's list stays open (hubFile);
+  // the SD list is opened for the read and closed (a scan that ends replaces its file)
+  const Shown& row(int i) {
     uint32_t line = rows[i];
     for (auto& s : shown) {
       if (s.first == line) {
@@ -382,23 +420,29 @@ struct FirmwaresPage : Page {
     if (shown.size() > 60) {
       shown.clear();
     }
-    if (!hubFile) {
+    FILE* sdFile = 0;
+    if (hub && !hubFile) {
       hubFile = catalog::openHub();
+    } else if (!hub && !catalog::openSd(sdFile)) {
+      sdFile = 0;
     }
     FwList one;
     for (int k = i; k < (int)rows.size() && k < i + 12; k++) {
       Shown r{"?", "", "", 0};
-      if (catalog::hubAt(hubFile, rows[k], one)) {
+      if (hub ? catalog::hubAt(hubFile, rows[k], one) : catalog::sdAt(sdFile, rows[k], one)) {
         r = {one.str(one[0].name), one.str(one[0].version), one.str(one[0].file), one[0].flags};
       }
       shown.push_back({rows[k], r});
+    }
+    if (sdFile) {
+      fclose(sdFile);
     }
     return shown[shown.size() - std::min<int>(12, rows.size() - i)].second;
   }
   void tick() override {
     char now[24];
     deviceNow(now);
-    if (seen != FwList::changes || seenSize != catalog::sd.size() || strcmp(now, device)) {
+    if (seen != FwList::changes || strcmp(now, device)) {
       filter();
       redraw();
     }
@@ -414,7 +458,12 @@ struct FirmwaresPage : Page {
       f = catalog::details(one, 0);
       f.onSd = onSd(f.file.c_str());
     } else {
-      f = catalog::details(catalog::sd, rows[sel]);
+      FwList one;
+      if (!catalog::sdAt(rows[sel], one)) {
+        toast("Can't read it from the SD card.", true);
+        return;
+      }
+      f = catalog::details(one, 0);
     }
     push(new FirmwarePage(f, hub));
   }
@@ -467,7 +516,21 @@ struct FirmwaresPage : Page {
       text(4, y0, s.c_str(), ACCENT);
       y0 += 11;
     }
+    char count[64];
+    if (!hub && ui::scanning()) {
+      text(4, y0, "Reading the SD card...", ACCENT, SCREEN_W - 8);
+      y0 += 11;
+    }
+    if (!hub && !catalog::sdComplete() && catalog::sdFound()) {
+      snprintf(count, sizeof count, "Showing %u of %u. Remove files from /fm1.", (unsigned)catalog::sdShown(),
+               (unsigned)catalog::sdFound());
+      text(4, y0, count, WARN, SCREEN_W - 8);
+      y0 += 11;
+    }
     if (rows.empty()) {
+      if (!hub && ui::scanning()) {
+        return;  // (no list yet: the line above says why)
+      }
       const char* why = !hal::sd()                           ? "No SD card."
                         : !q.empty()                         ? "Nothing has that in it."
                         : hub && catalog::hubUpdated.empty() ? "No Hub list yet: u to get it (Wi-Fi)."
@@ -482,14 +545,13 @@ struct FirmwaresPage : Page {
       const char *name, *version;
       bool there, beta;
       if (p->hub) {
-        const Shown& r = p->hubRow(i);
+        const Shown& r = p->row(i);
         name = r.name.c_str(), version = r.version.c_str();
         there = onSd(r.file.c_str()), beta = r.flags & FwItem::BETA;
       } else {
-        const FwList& l = catalog::sd;
-        const FwItem& it = l[p->rows[i]];
-        name = l.str(it.name), version = l.str(it.version);
-        there = false, beta = it.flags & FwItem::BETA;
+        const Shown& r = p->row(i);
+        name = r.name.c_str(), version = r.version.c_str();
+        there = false, beta = r.flags & FwItem::BETA;
       }
       uint8_t mark = there ? GOOD : beta ? WARN : 0;
       if (mark) {
@@ -736,7 +798,7 @@ struct AboutPage : Page {
     } else {
       line("SD: none", BAD);
     }
-    snprintf(l, sizeof l, "Firmwares: %u on SD, %u on the Hub", (unsigned)catalog::sd.size(), hubN);
+    snprintf(l, sizeof l, "Firmwares: %u on SD, %u on the Hub", (unsigned)catalog::sdShown(), hubN);
     line(l, TEXT);
     if (!catalog::hubUpdated.empty()) {
       line(("Hub list: " + catalog::hubUpdated).c_str(), DIM);
