@@ -48,6 +48,7 @@ static const Item HOME[] = {
     {"Sounds", ".syx, setups, SLOOP", []() { return soundsPage(); }},
     {"MIDI", "Devices, routing", []() { return midiPage(); }},
     {"Keys", "Play it from here", []() { return keysPage(); }},
+    {"Tilt", "Two MIDI CCs from tilt", []() { return tiltPage(); }},
     {"USB disk", "The SD card, on a computer", []() -> Page* {
        if (!hal::sd() || jobs::running) {
          toast(hal::sd() ? "Busy with something else." : "No SD card.", true);

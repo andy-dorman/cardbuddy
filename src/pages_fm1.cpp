@@ -1,5 +1,5 @@
 // The pages for the FM-1 on the USB-C port: backup and recovery (and recovery mode itself), USB disk mode, sounds,
-// SLOOP, MIDI, and the keyboard as a MIDI controller
+// SLOOP, MIDI, the keyboard as a MIDI controller, and tilt as MIDI CCs
 #include <M5Cardputer.h>
 #include <dirent.h>
 #include <strings.h>
@@ -15,6 +15,7 @@
 #include "midi.h"
 #include "sloop.h"
 #include "sounds.h"
+#include "tilt.h"
 #include "uboot.h"
 #include "ui.h"
 
@@ -616,7 +617,7 @@ static void saveFlag(const char* key, bool on) {
 }
 
 struct MidiPage : ListPage {
-  MidiPage() : ListPage("MIDI", "r routing  b bluetooth  k keys  esc back") {
+  MidiPage() : ListPage("MIDI", "r routing  b bluetooth  k keys  t tilt  esc back") {
     fill = [](ListPage& p) {
       midi::Dev v;
       for (int d = 0; d < MIDI_DEVS; d++) {
@@ -640,8 +641,10 @@ struct MidiPage : ListPage {
         saveFlag("bluetooth", hal::bleIsOn());
       } else if (c == 'k') {
         push(keysPage());
+      } else if (c == 't') {
+        push(tiltPage());
       }
-      return c == 'r' || c == 'b' || c == 'k';
+      return c == 'r' || c == 'b' || c == 'k' || c == 't';
     };
     refill();
   }
@@ -762,4 +765,129 @@ struct KeysPage : Page {
 
 Page* ui::keysPage() {
   return new KeysPage();
+}
+
+// ------------------------------------------------------------------------------------------------- tilt ---
+// Tilt as two MIDI CCs, from the IMU unit on the Grove port (device MIDI_TOUCH, "Keys"). It starts in Hold: space lets
+// the CCs go, enter sets the Zero position here. The arrows pick a CC and step its number, [ ] the channel.
+// The numbers and the channel are saved a moment after the last change
+struct TiltPage : Page {
+  struct Saved {
+    uint8_t cc[tilt::CC_COUNT];
+    uint8_t channel;  // 1 to 16
+  };
+  static constexpr const char* SAVED = "tilt";
+  Saved set = {{1, 74}, 1};
+  tilt::Tilt logic;
+  bool hold = true, present = false, needZero = false, unsaved = false;
+  int sel = 0;
+  uint8_t value[tilt::CC_COUNT] = {64, 64};  // (what each sent last, for the bars)
+  uint32_t readAt = 0, retryAt = 0, changedAt = 0;
+  uint8_t drawn[8] = {};  // (what the screen shows, to redraw on a change only)
+  const char* title() override { return "Tilt"; }
+  const char* hints() override { return "space hold  enter zero  ; . , / cc  [ ] ch  esc back"; }
+  TiltPage() {
+    midi::route(true);
+    Saved s;
+    if (hal::load(SAVED, &s, sizeof s) && s.cc[0] < 128 && s.cc[1] < 128 && s.channel >= 1 && s.channel <= 16) {
+      set = s;
+    }
+    present = M5.Imu.begin(&M5.Ex_I2C);
+    needZero = present;
+    readAt = retryAt = hal::millis();
+  }
+  ~TiltPage() {
+    save();
+  }
+  void save() {
+    if (unsaved) {
+      hal::save(SAVED, &set, sizeof set);
+      unsaved = false;
+    }
+  }
+  void changed() {
+    unsaved = true;
+    changedAt = hal::millis();
+  }
+  void poll() override {
+    uint32_t now = hal::millis();
+    if (!present || now - readAt < 20) {
+      return;
+    }
+    readAt = now;
+    tilt::Sample s;
+    if (!M5.Imu.getAccel(&s.a[0], &s.a[1], &s.a[2])) {
+      present = false;  // (the unit is gone)
+      return;
+    }
+    if (needZero) {
+      logic.zero(s);
+      needZero = false;
+    }
+    tilt::Messages out = logic.step(s, hold, set.cc[tilt::FORWARD_BACK], set.cc[tilt::LEFT_RIGHT], set.channel);
+    for (int i = 0; i < out.count; i++) {
+      midi::bytesIn(MIDI_TOUCH, out.m[i], 3);
+      for (int c = 0; c < tilt::CC_COUNT; c++) {
+        if (out.m[i][1] == set.cc[c]) {
+          value[c] = out.m[i][2];
+        }
+      }
+    }
+  }
+  void tick() override {
+    uint32_t now = hal::millis();
+    if (!present && now - retryAt >= 1000) {
+      retryAt = now;
+      if (M5.Imu.begin(&M5.Ex_I2C)) {
+        present = needZero = hold = true;
+      }
+    }
+    if (unsaved && now - changedAt >= 1000) {
+      save();
+    }
+    uint8_t now_[8] = {value[0], value[1], hold, present, (uint8_t)midi::routing, 0, 0, 0};
+    if (memcmp(now_, drawn, sizeof drawn)) {
+      memcpy(drawn, now_, sizeof drawn);
+      redraw();
+    }
+  }
+  void key(const Key& k) override {
+    if (k.ch == ' ') {
+      hold = !hold;
+    } else if (k.enter) {
+      needZero = true;  // (from the next sample)
+    } else if (k.up || k.down) {
+      sel = 1 - sel;
+    } else if (k.left || k.right) {
+      set.cc[sel] = (set.cc[sel] + (k.right ? 1 : 127)) % 128;
+      logic.clear((tilt::Cc)sel);
+      changed();
+    } else if (k.ch == '[' || k.ch == ']') {
+      set.channel = (set.channel - 1 + (k.ch == ']' ? 1 : 15)) % 16 + 1;
+      logic.clear(tilt::FORWARD_BACK);
+      logic.clear(tilt::LEFT_RIGHT);
+      changed();
+    }
+  }
+  void draw() override {
+    char s[48];
+    snprintf(s, sizeof s, "channel %d   %s   %s", set.channel, hold ? "hold" : "live", midi::routing ? "" : "(routing off)");
+    text(6, TOP + 2, s, ACCENT);
+    if (!present) {
+      wrap(6, TOP + 22, SCREEN_W - 12, "Plug the IMU unit into the Grove port", TEXT, 6);
+      return;
+    }
+    static const char* NAMES[tilt::CC_COUNT] = {"forward/back", "left/right"};
+    for (int i = 0; i < tilt::CC_COUNT; i++) {
+      int y = TOP + 22 + i * 2 * ROW;
+      uint8_t color = i == sel ? ACCENT : TEXT;
+      snprintf(s, sizeof s, "%s   cc %d", NAMES[i], set.cc[i]);
+      text(6, y, s, color);
+      bar(6, y + ROW - 2, SCREEN_W - 12, 6, value[i], 127);
+    }
+  }
+};
+
+Page* ui::tiltPage() {
+  return new TiltPage();
 }

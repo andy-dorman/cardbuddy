@@ -37,6 +37,7 @@ struct Page {
   virtual void key(const Key& k) = 0;
   virtual void draw() = 0;                 // the body: y from TOP to BOTTOM
   virtual void tick() {}                   // ten times a second
+  virtual void poll() {}                   // on every pass of the loop
   virtual void jobDone() {}                // a job (jobs.h) finished, this page on screen
   virtual bool closing() { return true; }  // back: false keeps it open (it handled back itself)
   virtual bool raw() { return false; }     // it wants held: the keys down now, on every change (presses and releases)
@@ -81,5 +82,6 @@ Page* diskPage();     // USB disk mode (hal::diskMode)
 Page* soundsPage();
 Page* midiPage();
 Page* keysPage();
+Page* tiltPage();
 void install(const Firmware& f);  // asks, then installs it on the FM-1
 }  // namespace ui

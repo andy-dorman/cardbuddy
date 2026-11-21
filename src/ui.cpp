@@ -426,6 +426,7 @@ void ui::loop() {
     }
     dirty = true;
   }
+  stack.back()->poll();  // (the page on screen now: a key can have closed the one before)
   if (hal::millis() - lastTick >= 100) {
     lastTick = hal::millis();
     watch();

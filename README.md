@@ -27,6 +27,7 @@ All of it through fm1buddy's own code (`lib/fm1core`, and `lib/fm1s3` for the ES
 - **SLOOP**: back it up, restore a backup or one project of it (`0`, `a`-`d`), save and load songs, load `.wav` files into a sample slot (`1`-`4`)
 - **MIDI**: the devices on the hub, routing between them (`r`, with `/midimap.txt`), Bluetooth MIDI (`b`)
 - **Keys**: the keyboard as a MIDI controller, two octaves as trackers lay them out (`z s x d c v`... and `q 2 w 3 e r`...), `-` `=` octave, `[` `]` channel
+- **Tilt**: the IMU unit on the Grove port as two MIDI CCs, forward/back and left/right (CC 1 and CC 74, channel 1 as it starts). `space` Hold, `enter` Zero position, `;` `.` select, `,` `/` the CC number, `[` `]` channel
 - **USB disk**: the SD card as a computer's drive; it goes back by itself once it's ejected there
 - **Settings**: Wi-Fi, theme, brightness, Bluetooth MIDI, USB MIDI on a computer
 
@@ -43,7 +44,7 @@ The Cardputer has 8 MB of flash and no PSRAM, where fm1buddy's board has 8 MB of
 
 Not tried on a Cardputer yet: how much memory is left with Wi-Fi, the USB host and Bluetooth all on (Settings > About says), and the USB-C port as the host.
 
-Next: what the Cardputer is good at: tilt as MIDI CCs, previewing samples and recordings on its speaker, sampling from its mic.
+Next: what the Cardputer is good at: previewing samples and recordings on its speaker, sampling from its mic.
 
 ## Building
 
