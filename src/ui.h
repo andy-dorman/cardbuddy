@@ -82,4 +82,9 @@ Page* soundsPage();
 Page* midiPage();
 Page* keysPage();
 void install(const Firmware& f);  // asks, then installs it on the FM-1
+// its install ended because its data save failed (the reason is on screen): asks, and on y installs with no data save
+void installAnyway(const Firmware& f);
+// its install ended well: asks "Put your saved data back?" when a data save has the installed firmware and the unique ID
+// of the FM-1 that the install's data save read, and on y starts the restore
+void askDataBack(const Firmware& f);
 }  // namespace ui

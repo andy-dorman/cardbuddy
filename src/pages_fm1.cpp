@@ -174,6 +174,108 @@ void ui::install(const Firmware& f) {
   }
 }
 
+void ui::installAnyway(const Firmware& f) {
+  Firmware again = f;
+  again.onSd = true;  // (the install got its file on the SD card before the data save)
+  again.file = jobs::saved;
+  ask("Install", "The data was not saved. Install anyway?", [again]() {
+    if (!jobs::install(again, false)) {
+      busy();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------------- the data restore ---
+static void startDataBack(const std::string& file, bool dataSaveFirst, bool transfer);
+
+// the data of a data save going back on the FM-1: its steps and the flash map, then what happened
+struct DataBackPage : Page {
+  std::string file;
+  explicit DataBackPage(const std::string& file) : file(file) {}
+  const char* title() override { return "Your data"; }
+  const char* hints() override { return jobs::running ? "leave it plugged in" : "enter done"; }
+  bool closing() override { return !jobs::running; }
+  void key(const Key& k) override {
+    if (k.enter && !jobs::running) {
+      pop();
+    }
+  }
+  void tick() override { redraw(); }
+  // a restore that cannot finish offers recovery mode with the data save. A data save of another FM-1 asks the
+  // transfer question, and its yes runs the job again as a transfer
+  void jobDone() override {
+    if (jobs::kind != jobs::DATA_RESTORE || jobs::ok) {
+      return;
+    }
+    if (jobs::anotherFm1) {
+      std::string name = file;
+      ask("Your data",
+          "This data save is from another FM-1. Put it on this FM-1? The two FM-1 devices can get the same Bluetooth "
+          "identity.",
+          [name]() {
+            pop();  // (this page: the new job gets its own)
+            startDataBack(name, true, true);
+          });
+      return;
+    }
+    std::string path = DATA_SAVES_DIR "/" + file;
+    std::string question;
+    if (jobs::noPackage) {
+      question = "No firmware in /fm1 matches " + file + ". Start recovery mode with all of that data save?";
+    } else if (jobs::sectorFailed) {
+      question = "A sector failed 3 times. Start recovery mode with " + file + "?";
+    } else {
+      return;
+    }
+    ask("Recovery", question, [path]() {
+      if (!jobs::prepare(path)) {
+        busy();
+      }
+    });
+  }
+  void draw() override {
+    bool mine = jobs::kind == jobs::DATA_RESTORE;
+    int w = SCREEN_W - 12;
+    if (mine && (jobs::running || jobs::mapKind[0] != jobs::MAP_UNREAD)) {
+      drawMap(SCREEN_W - 16 * 6 - 4, TOP + 6, 6);
+      w = SCREEN_W - 16 * 6 - 16;
+    }
+    int y = TOP + 4;
+    text(6, y, file.c_str(), ACCENT, w);
+    y += 12;
+    if (jobs::running) {
+      wrap(6, y, w, jobs::status().c_str(), TEXT, 7);
+    } else if (mine && jobs::ok) {
+      wrap(6, y, w, jobs::error.empty() ? "Done: your data is on the FM-1 again." : jobs::error.c_str(), GOOD, 7);
+    } else if (mine) {
+      wrap(6, y, w, jobs::error.c_str(), BAD, 7);  // (a refusal says why, and has no way round it)
+    } else {
+      wrap(6, y, w, "Starting...", TEXT, 7);
+    }
+  }
+};
+
+// start the restore of a data save, and show its page. dataSaveFirst: a data save of the current data comes first.
+// transfer: the data save may be from another FM-1
+static void startDataBack(const std::string& file, bool dataSaveFirst, bool transfer) {
+  int d = fm1::current();
+  if (d < 0) {
+    toast("Plug the FM-1 into the USB-C port (on a powered hub).", true);
+  } else if (!jobs::restoreData(d, file, dataSaveFirst, transfer)) {
+    busy();
+  } else {
+    push(new DataBackPage(file));
+  }
+}
+
+void ui::askDataBack(const Firmware& f) {
+  std::string file = jobs::dataSaveFor(f.product, jobs::dataSaveUid);
+  if (file.empty()) {
+    return;
+  }
+  ask("Your data", "Put your saved data back?", [file]() { startDataBack(file, false, false); });
+}
+
 // --------------------------------------------------------------------------------- backup & recover ---
 struct Choice {
   std::string path, name, what;
@@ -224,6 +326,22 @@ static std::vector<Choice> choices() {
   return out;
 }
 
+// the data saves in /backups/switch, newest first. The list reads no unique ID: the restore job checks it
+static Page* dataSaves() {
+  ListPage* p = new ListPage("Data saves", "enter put back  esc back");
+  p->empty = "No data saves in " DATA_SAVES_DIR ".";
+  p->fill = [](ListPage& p) {
+    for (const datasave::Save& s : jobs::dataSaveList()) {
+      std::string file = s.file;
+      p.rows.push_back({file, s.firmware, [file]() {
+                          ask("Your data", "Put this data save back?", [file]() { startDataBack(file, true, false); });
+                        }});
+    }
+  };
+  p->refill();
+  return p;
+}
+
 struct BackupPage : ListPage {
   BackupPage() : ListPage("Backup & recover", "esc back") {
     fill = [](ListPage& p) {
@@ -236,6 +354,7 @@ struct BackupPage : ListPage {
                             busy();
                           }
                         }});
+      p.rows.push_back({"Data saves", "put one back", []() { push(dataSaves()); }});
       std::vector<Choice> cs = choices();
       if (cs.empty()) {
         p.rows.push_back({"Recover: nothing to put on it", hal::sd() ? "" : "no SD card", []() {

@@ -238,6 +238,9 @@ struct FirmwarePage : Page {
     } else if (jobs::kind == jobs::INSTALL && jobs::ok) {
       f.onSd = true;
       toast("Installed.");
+      askDataBack(f);
+    } else if (jobs::kind == jobs::INSTALL && jobs::dataSaveFailed) {
+      installAnyway(f);
     } else if (jobs::kind == jobs::FW_UPDATE && jobs::ok) {
       for (size_t i = 0; i < catalog::sd.size(); i++) {
         if (!strcasecmp(catalog::sd.str(catalog::sd[i].file), jobs::saved.c_str())) {
