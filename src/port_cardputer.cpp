@@ -18,9 +18,13 @@
 #define SD_FILES 4
 
 bool port::sdBegin() {
-  pinMode(SD_GATE, OUTPUT);
-  digitalWrite(SD_GATE, HIGH);
-  delay(2);
+  // only the ADV has the gate: on the original Cardputer, GPIO5 is a column of the keyboard matrix (8 9 i o k l , .),
+  // and driving it stops those keys
+  if (M5.getBoard() == m5::board_t::board_M5CardputerADV) {
+    pinMode(SD_GATE, OUTPUT);
+    digitalWrite(SD_GATE, HIGH);
+    delay(2);
+  }
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (SD.begin(SD_CS, SPI, 25000000, "/sdcard", SD_FILES)) {
     return true;
