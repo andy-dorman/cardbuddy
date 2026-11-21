@@ -277,8 +277,11 @@ static void watch() {
       hubNew = true;
       catalog::hubUpdated = jobs::hubUpdated;
       catalog::scanSd();
-    } else if (jobs::kind == jobs::DOWNLOAD || jobs::kind == jobs::INSTALL || jobs::kind == jobs::FW_UPDATE) {
+    } else if (jobs::kind == jobs::DOWNLOAD || jobs::kind == jobs::INSTALL || jobs::kind == jobs::FW_UPDATE || jobs::kind == jobs::SYNC) {
       catalog::scanSd();
+    }
+    if (jobs::kind == jobs::SYNC && !jobs::hubUpdated.empty()) {
+      catalog::hubUpdated = jobs::hubUpdated;  // (the list it got first)
     }
     if (!jobs::ok && !jobs::error.empty()) {
       ui::toast(jobs::error, true);

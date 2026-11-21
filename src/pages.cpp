@@ -1,4 +1,5 @@
-// The pages: home, the firmware lists (the SD card's and the Hub's) and a firmware's details, Wi-Fi, settings, about
+// The pages: home, the firmware lists (the SD card's and the Hub's) and a firmware's details, the sync, Wi-Fi, settings,
+// about
 #include <M5Cardputer.h>
 #include <strings.h>
 
@@ -34,6 +35,89 @@ static std::string size(uint32_t n) {
   return b;
 }
 
+// ------------------------------------------------------------------------------------------------- sync ---
+// The Hub's firmwares into /fm1 (jobs::sync), and what it has done so far. esc stops it: the file it is on finishes
+struct SyncPage : Page {
+  bool stopping = false;
+  const char* title() override { return "Firmware: sync"; }
+  const char* hints() override { return jobs::running ? "esc stop after this file" : "esc back"; }
+  bool closing() override { return !jobs::running; }
+  void key(const Key& k) override {
+    if (k.back && jobs::running && !stopping) {
+      stopping = true;
+      jobs::cancel();
+    }
+  }
+  void tick() override {
+    if (jobs::running) {
+      redraw();
+    }
+  }
+  // what the job is doing now
+  static const char* step() {
+    switch ((int)jobs::step) {
+      case jobs::JOINING:
+        return "Joining Wi-Fi";
+      case jobs::READING:
+        return "Making the plan";
+      case jobs::CHECKING:
+        return "Checking it";
+      case jobs::FETCHING:
+        return jobs::syncOf ? "Syncing" : *jobs::syncName ? "Getting Shrub and the sampler"
+                                                          : "Getting the Hub's list";
+    }
+    return "Starting";
+  }
+  void draw() override {
+    char line[80];
+    int y = TOP + 3;
+    if (jobs::running) {
+      text(6, y, stopping ? "Stopping after this file" : step(), stopping ? WARN : TEXT, SCREEN_W - 12);
+      y += 11;
+      snprintf(line, sizeof line, "%u of %u", (unsigned)jobs::syncAt, (unsigned)jobs::syncOf);
+      text(6, y, jobs::syncOf ? line : "", TEXT);
+      y += 11;
+      text(6, y, jobs::syncName, DIM, SCREEN_W - 12);
+      y += 13;
+      bar(6, y, SCREEN_W - 12, 6, jobs::done, jobs::total);
+      y += 14;
+    } else {
+      bool bad = !jobs::ok && !jobs::error.empty();
+      text(6, y, bad ? jobs::error.c_str() : stopping ? "Stopped. Complete files stay."
+                                                      : "Done.",
+           bad ? BAD : GOOD, SCREEN_W - 12);
+      y += 20;
+    }
+    snprintf(line, sizeof line, "new %u  updated %u", (unsigned)jobs::syncNew, (unsigned)jobs::syncUpdated);
+    text(6, y, line, TEXT);
+    y += 11;
+    snprintf(line, sizeof line, "unchanged %u", (unsigned)jobs::syncUnchanged);
+    text(6, y, line, TEXT);
+    y += 11;
+    snprintf(line, sizeof line, "removed %u", (unsigned)jobs::syncRemoved);
+    text(6, y, line, TEXT);
+    y += 11;
+    snprintf(line, sizeof line, "failed %u", (unsigned)jobs::syncFailed);
+    text(6, y, line, jobs::syncFailed ? BAD : TEXT);
+    y += 13;
+    wrap(6, y, SCREEN_W - 12, jobs::saved.c_str(), WARN, 4);  // (a line for each report of Shrub and the sampler)
+  }
+};
+
+// start a sync and open its page; none (and why, as a toast) if it can't start
+static Page* startSync() {
+  if (!hal::sd()) {
+    toast("No SD card.", true);
+  } else if (!settings.ssid[0]) {
+    toast("Set up Wi-Fi first (Settings > Wi-Fi).", true);
+  } else if (!jobs::sync()) {
+    toast("Busy with something else.", true);
+  } else {
+    return new SyncPage();
+  }
+  return 0;
+}
+
 // ------------------------------------------------------------------------------------------------- home ---
 struct Item {
   const char* name;
@@ -44,6 +128,7 @@ struct Item {
 static const Item HOME[] = {
     {"Firmware: SD card", "Install what's in /fm1", []() { return firmwarePage(false); }},
     {"Firmware: Hub", "mutant.cloud's firmwares", []() { return firmwarePage(true); }},
+    {"Firmware: sync", "The Hub's firmwares onto the SD card", []() { return startSync(); }},
     {"Backup & recover", "The FM-1's whole flash", []() { return backupPage(); }},
     {"Sounds", ".syx, setups, SLOOP", []() { return soundsPage(); }},
     {"MIDI", "Devices, routing", []() { return midiPage(); }},
@@ -97,7 +182,37 @@ struct FirmwarePage : Page {
     if (fromHub && !f.onSd) {
       return "enter install  d download";
     }
-    return "enter install";
+    return fromHub ? "enter install" : "enter install  u update";
+  }
+  // replace this SD card firmware with its newer Hub version: the Hub's list on the SD card is read, not fetched
+  void update() {
+    syncplan::HubMatch m(f.file.c_str(), f.product.c_str(), f.sha256.c_str());
+    m.sdSize(f.size);
+    if (!hal::sd()) {
+      toast("No SD card.", true);
+    } else if (!catalog::matchHub(m)) {
+      toast("No Hub list yet: open the Hub page first.", true);
+    } else if (m.result() == syncplan::HubMatch::SAME_FILE) {
+      toast("It's the newest one.");
+    } else if (m.result() == syncplan::HubMatch::NOT_LISTED) {
+      toast("It isn't in the Hub's list.");
+    } else if (!settings.ssid[0]) {
+      toast("Set up Wi-Fi first (Settings > Wi-Fi).", true);
+    } else if (FILE* list = catalog::openHub()) {
+      FwList one;
+      bool read = catalog::hubAt(list, m.line(), one);
+      fclose(list);
+      Firmware newer = read ? catalog::details(one, 0) : Firmware();
+      size_t k = f.file.rfind('/');
+      if (k != std::string::npos && newer.file.find('/') == std::string::npos) {
+        newer.file = f.file.substr(0, k + 1) + newer.file;  // (in the old one's folder)
+      }
+      if (!read) {
+        toast("Can't read it from the SD card.", true);
+      } else if (!jobs::updateFirmware(newer, f.file)) {
+        toast("Busy with something else.", true);
+      }
+    }
   }
   void key(const Key& k) override {
     if (k.up && scroll > 0) {
@@ -110,6 +225,8 @@ struct FirmwarePage : Page {
       } else if (!jobs::download(f)) {
         toast("Busy with something else.", true);
       }
+    } else if (k.ch == 'u' && !fromHub) {
+      update();
     } else if (k.enter) {
       install(f);
     }
@@ -121,10 +238,18 @@ struct FirmwarePage : Page {
     } else if (jobs::kind == jobs::INSTALL && jobs::ok) {
       f.onSd = true;
       toast("Installed.");
+    } else if (jobs::kind == jobs::FW_UPDATE && jobs::ok) {
+      for (size_t i = 0; i < catalog::sd.size(); i++) {
+        if (!strcasecmp(catalog::sd.str(catalog::sd[i].file), jobs::saved.c_str())) {
+          f = catalog::details(catalog::sd, i);  // (the new file)
+          break;
+        }
+      }
+      toast(f.version.empty() ? "Updated." : "Updated to v" + f.version + ".");
     }
   }
   void tick() override {
-    if (jobs::running && (jobs::kind == jobs::INSTALL || jobs::kind == jobs::DOWNLOAD)) {
+    if (jobs::running && (jobs::kind == jobs::INSTALL || jobs::kind == jobs::DOWNLOAD || jobs::kind == jobs::FW_UPDATE)) {
       redraw();
     }
   }
@@ -195,7 +320,7 @@ struct FirmwaresPage : Page {
 
   const char* title() override { return hub ? "Firmware: Hub" : "Firmware: SD card"; }
   const char* hints() override {
-    return hub ? "type to find  tab SD  u update" : "type to find  tab Hub";
+    return hub ? "type to find  tab SD  u update  s sync" : "type to find  tab Hub";
   }
   bool closing() override {
     if (!q.empty()) {
@@ -315,6 +440,10 @@ struct FirmwaresPage : Page {
         toast("Set up Wi-Fi first (Settings > Wi-Fi).", true);
       } else if (!jobs::hubList()) {
         toast("Busy with something else.", true);
+      }
+    } else if (k.ch == 's' && hub && q.empty()) {
+      if (Page* p = startSync()) {
+        push(p);
       }
     } else if (k.ch) {
       q += k.ch;
