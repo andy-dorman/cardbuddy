@@ -75,7 +75,9 @@ Page* firmwarePage(bool hub);
 Page* wifiPage();
 Page* settingsPage();
 Page* aboutPage();
-Page* textPage(const char* title, const char* prompt, bool secret, void (*done)(const std::string& s, void* arg), void* arg);
+// start: the text that the page shows at first. needText: enter does nothing while the text is empty (the name page)
+Page* textPage(const char* title, const char* prompt, bool secret, void (*done)(const std::string& s, void* arg), void* arg,
+               const std::string& start = "", bool needText = false);
 Page* backupPage();
 Page* recoverPage();  // recovery mode (hal::recoveryMode)
 Page* diskPage();     // USB disk mode (hal::diskMode)

@@ -13,6 +13,7 @@
 #include "hal.h"
 #include "jobs.h"
 #include "midi.h"
+#include "savename.h"
 #include "sloop.h"
 #include "sounds.h"
 #include "uboot.h"
@@ -78,9 +79,11 @@ static void drawMap(int x, int y, int c) {
 
 // --------------------------------------------------------------------------------------- a list page ---
 // rows of text (and a dim note on the right), and what enter (or another key) does with the one chosen
+// file: the name of the saved file that the key r renames on this row ("" if the row is no saved file)
 struct Row {
   std::string name, note;
   std::function<void()> enter;
+  std::string file;
 };
 
 struct ListPage : Page {
@@ -276,9 +279,62 @@ void ui::askDataBack(const Firmware& f) {
   ask("Your data", "Put your saved data back?", [file]() { startDataBack(file, false, false); });
 }
 
+// ------------------------------------------------------------------------------------------- name page ---
+// the name page: one at a time, so its callback is kept here (the text page takes a plain function)
+static std::function<void(const std::string&)> nameDone;
+
+static void askName(const char* title, const std::string& prompt, const std::string& start,
+                    std::function<void(const std::string&)> go) {
+  nameDone = go;
+  push(textPage(title, prompt.c_str(), false, [](const std::string& typed, void*) {
+    auto go = nameDone;
+    go(typed); }, 0, start, true));
+}
+
+// the UTC date that a default name holds, or why it holds none
+static std::string dateNote() {
+  std::string date = savename::dateText(time(0));
+  return date.empty() ? "No date yet: join Wi-Fi first." : "UTC date " + date + ".";
+}
+
+// the name page of a save that the user starts. It runs no job: the job starts when enter takes the text
+static void askSaveName(savename::Kind kind, int d, std::function<bool(const std::string&)> start) {
+  const Fm1Id* id = fm1::known(d);
+  askName("Name the file", dateNote() + " enter saves with this name.", jobs::defaultName(kind, id ? id->text : ""),
+          [start](const std::string& typed) {
+            if (!start(typed)) {
+              busy();
+            }
+          });
+}
+
+// the key r: the name page with the name of the selected file, and the rename. folder: where the file is
+static bool renameKey(char c, ListPage& p, const std::string& folder) {
+  if (c != 'r') {
+    return false;
+  }
+  if (p.rows.empty() || p.rows[p.sel].file.empty()) {
+    return true;
+  }
+  std::string file = p.rows[p.sel].file;
+  size_t dot = folder == SETUPS_DIR ? std::string::npos : file.rfind('.');
+  std::string stem = dot == std::string::npos || !dot ? file : file.substr(0, dot);
+  ListPage* list = &p;
+  askName("Rename", "enter renames it. fn+esc goes back.", stem, [list, folder, file](const std::string& typed) {
+    if (jobs::renameSaved(folder, file, typed)) {
+      toast(jobs::saved == file ? "The name stays: " + file : "Renamed to " + jobs::saved);
+    } else {
+      toast(jobs::error.empty() ? "Can't rename it." : jobs::error, true);
+    }
+    list->refill();
+  });
+  return true;
+}
+
 // --------------------------------------------------------------------------------- backup & recover ---
 struct Choice {
   std::string path, name, what;
+  long number = 0;  // its save number (a firmware: 0)
 };
 
 // the backups that can go back on it, newest first. The SD card's firmwares are too many for a list here: the page of
@@ -294,6 +350,7 @@ static std::vector<Choice> choices() {
         continue;
       }
       Choice c{BACKUPS_DIR "/" + std::string(e->d_name), e->d_name, "backup"};
+      c.number = savename::numberOfSaved(dir, e->d_name);
       // its .txt beside it says what it was taken from
       if (FILE* f = fopen((dir + "/" + std::string(e->d_name, n - 4) + ".txt").c_str(), "r")) {
         char line[96];
@@ -310,8 +367,7 @@ static std::vector<Choice> choices() {
     closedir(d);
   }
   std::sort(found.begin(), found.end(), [](const Choice& a, const Choice& b) {
-    long x = atol(a.name.c_str() + 4), y = atol(b.name.c_str() + 4);
-    return x != y ? x > y : a.name > b.name;
+    return savename::newer(savename::Numbered{a.name, a.number}, savename::Numbered{b.name, b.number});
   });
   out.insert(out.end(), found.begin(), found.end());
   return out;
@@ -319,16 +375,18 @@ static std::vector<Choice> choices() {
 
 // the data saves in /backups/switch, newest first. The list reads no unique ID: the restore job checks it
 static Page* dataSaves() {
-  ListPage* p = new ListPage("Data saves", "enter put back  esc back");
+  ListPage* p = new ListPage("Data saves", "enter put back  r name  esc back");
   p->empty = "No data saves in " DATA_SAVES_DIR ".";
   p->fill = [](ListPage& p) {
     for (const datasave::Save& s : jobs::dataSaveList()) {
       std::string file = s.file;
       p.rows.push_back({file, s.firmware, [file]() {
                           ask("Your data", "Put this data save back?", [file]() { startDataBack(file, true, false); });
-                        }});
+                        },
+                        file});
     }
   };
+  p->other = [](char c, ListPage& p) { return renameKey(c, p, DATA_SAVES_DIR); };
   p->refill();
   return p;
 }
@@ -445,15 +503,15 @@ struct SdPickPage : Page {
 };
 
 struct BackupPage : ListPage {
-  BackupPage() : ListPage("Backup & recover", "esc back") {
+  BackupPage() : ListPage("Backup & recover", "r name  esc back") {
     fill = [](ListPage& p) {
       int d = fm1::current();
       const Fm1Id* id = fm1::known(d);
       p.rows.push_back({"Back up the FM-1 now", id ? id->text : "none here", [d]() {
                           if (d < 0) {
                             toast("Plug the FM-1 into the USB-C port (on a powered hub).", true);
-                          } else if (!jobs::backup(d)) {
-                            busy();
+                          } else {
+                            askSaveName(savename::BACKUP, d, [d](const std::string& name) { return jobs::backup(d, name); });
                           }
                         }});
       p.rows.push_back({"Data saves", "put one back", []() { push(dataSaves()); }});
@@ -466,6 +524,7 @@ struct BackupPage : ListPage {
       }
       for (const Choice& c : cs) {
         std::string path = c.path, name = c.name;
+        bool backup = !strncmp(path.c_str(), BACKUPS_DIR "/", strlen(BACKUPS_DIR "/"));
         p.rows.push_back({"Recover: " + c.name, c.what, [path, name]() {
                             ask("Recover", "Put " + name +
                                                " on an FM-1 that won't start? cardbuddy restarts into recovery mode, "
@@ -475,9 +534,11 @@ struct BackupPage : ListPage {
                                     busy();
                                   }
                                 });
-                          }});
+                          },
+                          backup ? name : ""});
       }
     };
+    other = [](char c, ListPage& p) { return renameKey(c, p, BACKUPS_DIR); };
     done = [](ListPage&) {
       if (jobs::kind == jobs::BACKUP && jobs::ok) {
         toast("Saved as " BACKUPS_DIR "/" + jobs::saved);
@@ -485,14 +546,28 @@ struct BackupPage : ListPage {
     };
     refill();
   }
+  // the map of a backup shows while it runs, and after it until a key: a new visit to this page shows the list
+  bool watched = false;
+  bool showsMap() {
+    return jobs::kind == jobs::BACKUP && (jobs::running || (watched && jobs::mapKind[0] != jobs::MAP_UNREAD));
+  }
+  void key(const Key& k) override {
+    if (showsMap() && !jobs::running) {
+      watched = false;  // (the key only closes the map)
+      redraw();
+      return;
+    }
+    ListPage::key(k);
+  }
   void tick() override {
     ListPage::tick();
     if (jobs::running && jobs::kind == jobs::BACKUP) {
+      watched = true;
       redraw();
     }
   }
   void draw() override {
-    if (jobs::kind == jobs::BACKUP && (jobs::running || jobs::mapKind[0] != jobs::MAP_UNREAD)) {
+    if (showsMap()) {
       drawMap(SCREEN_W - 16 * 6 - 4, TOP + 6, 6);
       wrap(6, TOP + 6, SCREEN_W - 16 * 6 - 16, jobs::running ? jobs::status().c_str() : "Backed up.", TEXT, 8);
       return;
@@ -636,7 +711,7 @@ static Page* setupsPage();
 static Page* sloopPage();
 
 static Page* syxPage(const std::string& folder) {
-  ListPage* p = new ListPage(folder.empty() ? "Sounds: /syx" : "/syx/" + folder, "enter send  esc back");
+  ListPage* p = new ListPage(folder.empty() ? "Sounds: /syx" : "/syx/" + folder, "enter send  r name  esc back");
   p->empty = "No .syx files here (" SYX_DIR " on the SD card).";
   p->fill = [folder](ListPage& p) {
     for (const sounds::File& f : sounds::list(folder)) {
@@ -654,9 +729,11 @@ static Page* syxPage(const std::string& folder) {
                           } else if (!jobs::send(d, path)) {
                             busy();
                           }
-                        }});
+                        },
+                        f.name});
     }
   };
+  p->other = [folder](char c, ListPage& p) { return renameKey(c, p, folder.empty() ? SYX_DIR : SYX_DIR "/" + folder); };
   p->done = [](ListPage&) {
     if (jobs::kind == jobs::SEND && jobs::ok) {
       toast("Sent.");
@@ -667,7 +744,7 @@ static Page* syxPage(const std::string& folder) {
 }
 
 static Page* setupsPage() {
-  ListPage* p = new ListPage("Setups", "enter load  e export  esc back");
+  ListPage* p = new ListPage("Setups", "enter load  e export  r name  esc back");
   p->empty = "No setups yet: Sounds > Keep its song and kits.";
   p->fill = [](ListPage& p) {
     for (const std::string& s : sounds::setups()) {
@@ -678,10 +755,14 @@ static Page* setupsPage() {
                               busy();
                             }
                           });
-                        }});
+                        },
+                        s});
     }
   };
   p->other = [](char c, ListPage& p) {
+    if (c == 'r') {
+      return renameKey(c, p, SETUPS_DIR);
+    }
     if (c == 'e' && !p.rows.empty() && !jobs::exportSetup(p.rows[p.sel].name, speaks.app[0] ? speaks.app : "FOMAJAM")) {
       busy();
     }
@@ -712,16 +793,14 @@ struct SoundsPage : ListPage {
       p.rows.push_back({"Send a .syx", devName(d), []() { push(syxPage("")); }});
       if (speaks.stockVoice) {
         p.rows.push_back({"Save its voice", ".syx", []() {
-                            if (!jobs::voice(device())) {
-                              busy();
-                            }
+                            int d = device();
+                            askSaveName(savename::VOICE, d, [d](const std::string& name) { return jobs::voice(d, name); });
                           }});
       }
       if (speaks.share) {
         p.rows.push_back({"Keep its song and kits", speaks.app, []() {
-                            if (!jobs::keep(device())) {
-                              busy();
-                            }
+                            int d = device();
+                            askSaveName(savename::SETUP, d, [d](const std::string& name) { return jobs::keep(d, name); });
                           }});
       }
       p.rows.push_back({"Setups", "load, export", []() { push(setupsPage()); }});
@@ -755,7 +834,7 @@ Page* ui::soundsPage() {
 // ----------------------------------------------------------------------------------------------- SLOOP ---
 static Page* sloopFiles(bool songs) {
   ListPage* p = new ListPage(songs ? "SLOOP: songs" : "SLOOP: backups",
-                             songs ? "enter load  esc back" : "enter restore  0 a-d project  esc back");
+                             songs ? "enter load  r name  esc back" : "enter restore  0 a-d  r name  esc back");
   p->empty = songs ? "No songs in " SLOOP_SONGS_DIR "." : "No backups in " SLOOP_DIR ".";
   p->fill = [songs](ListPage& p) {
     for (const std::string& f : songs ? sloop::songs() : sloop::backups()) {
@@ -769,11 +848,17 @@ static Page* sloopFiles(bool songs) {
                                   busy();
                                 }
                               });
-                        }});
+                        },
+                        f});
     }
   };
-  if (!songs) {  // one project: 0 the working one, a-d sections A-D
+  if (songs) {
+    p->other = [](char c, ListPage& p) { return renameKey(c, p, SLOOP_SONGS_DIR); };
+  } else {  // one project: 0 the working one, a-d sections A-D
     p->other = [](char c, ListPage& p) {
+      if (c == 'r') {
+        return renameKey(c, p, SLOOP_DIR);
+      }
       int id = c == '0' ? 0 : c >= 'a' && c <= 'd' ? 2 + c - 'a'
                                                    : -1;
       if (id >= 0 && !p.rows.empty() && !jobs::sloopProject(device(), p.rows[p.sel].name, id, id)) {
@@ -818,14 +903,14 @@ static Page* sloopPage() {
   ListPage* p = new ListPage("SLOOP", "esc back");
   p->fill = [](ListPage& p) {
     p.rows.push_back({"Back it up", SLOOP_DIR, []() {
-                        if (!jobs::sloopBackup(device())) {
-                          busy();
-                        }
+                        int d = device();
+                        askSaveName(savename::SLOOP_BACKUP, d,
+                                    [d](const std::string& name) { return jobs::sloopBackup(d, name); });
                       }});
     p.rows.push_back({"Save its song", SLOOP_SONGS_DIR, []() {
-                        if (!jobs::sloopSong(device())) {
-                          busy();
-                        }
+                        int d = device();
+                        askSaveName(savename::SLOOP_SONG, d,
+                                    [d](const std::string& name) { return jobs::sloopSong(d, name); });
                       }});
     p.rows.push_back({"Backups", "restore, projects", []() { push(sloopFiles(false)); }});
     p.rows.push_back({"Songs", "load", []() { push(sloopFiles(true)); }});

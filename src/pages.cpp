@@ -572,17 +572,21 @@ Page* ui::firmwarePage(bool hub) {
 struct TextPage : Page {
   const char* t;
   std::string prompt;  // (a copy: it's often made on the spot)
-  bool secret, shown = false;
+  bool secret, needText, shown = false;
   std::string s;
   void (*done)(const std::string&, void*);
   void* arg;
-  TextPage(const char* t, const char* prompt, bool secret, void (*done)(const std::string&, void*), void* arg)
-      : t(t), prompt(prompt), secret(secret), done(done), arg(arg) {}
+  TextPage(const char* t, const char* prompt, bool secret, void (*done)(const std::string&, void*), void* arg,
+           const std::string& start, bool needText)
+      : t(t), prompt(prompt), secret(secret), needText(needText), s(start), done(done), arg(arg) {}
   const char* title() override { return t; }
   const char* hints() override { return "enter ok  fn+esc back"; }
   bool typing() override { return true; }
   void key(const Key& k) override {
     if (k.enter) {
+      if (needText && s.empty()) {
+        return;
+      }
       auto fn = done;
       void* a = arg;
       std::string v = s;
@@ -607,8 +611,9 @@ struct TextPage : Page {
   }
 };
 
-Page* ui::textPage(const char* title, const char* prompt, bool secret, void (*done)(const std::string&, void*), void* arg) {
-  return new TextPage(title, prompt, secret, done, arg);
+Page* ui::textPage(const char* title, const char* prompt, bool secret, void (*done)(const std::string&, void*), void* arg,
+                   const std::string& start, bool needText) {
+  return new TextPage(title, prompt, secret, done, arg, start, needText);
 }
 
 // -------------------------------------------------------------------------------------------------- Wi-Fi ---
